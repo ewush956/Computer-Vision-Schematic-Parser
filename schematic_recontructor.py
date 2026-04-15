@@ -1,15 +1,4 @@
 """
-SchematicReconstructor — stub interface for XML-based schematic reconstruction.
-
-XML schema produced by the YOLO pipeline (Cell 18):
-
-    <schematic image="..." width="W" height="H">
-        <component id="0" class="resistor" confidence="0.9321">
-            <bounding_box xmin="42" ymin="88" xmax="130" ymax="145" />
-        </component>
-        ...
-    </schematic>
-
 Typical usage
 -------------
     reconstructor = SchematicReconstructor(confidence_threshold=0.35)
@@ -24,83 +13,11 @@ Typical usage
     reconstructor.annotate_labels(canvas, non_text)
     reconstructor.export_image(canvas, "output_001.png")
 
-I use arch btw
 """
 
 from __future__ import annotations
-from dataclasses import dataclass, field
 from pathlib import Path
-
-# ---------------------------------------------------------------------------
-# Data models
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class BoundingBox:
-    """Absolute pixel coordinates of one detected component."""
-
-    xmin: int
-    ymin: int
-    xmax: int
-    ymax: int
-
-    @property
-    def width(self) -> int:
-        return self.xmax - self.xmin
-
-    @property
-    def height(self) -> int:
-        return self.ymax - self.ymin
-
-    @property
-    def center_x(self) -> float:
-        return (self.xmin + self.xmax) / 2.0
-
-    @property
-    def center_y(self) -> float:
-        return (self.ymin + self.ymax) / 2.0
-
-
-@dataclass
-class Component:
-    """A single detected electrical component."""
-
-    id: int
-    class_name: str
-    confidence: float
-    bounding_box: BoundingBox
-    linked_text: str = ""
-    # AMTOJ: depending on how your regex works we can just leave non-label
-    # and low-confidence text as ""
-
-
-@dataclass
-class Line:
-    """
-    A directed connection between two components, produced by connect_components().
-    Rendered as an arrow from the center of from_id to the center of to_id.
-    """
-
-    from_id: int
-    to_id: int
-    # Feel free to add whatever other attributes, I'll probably implement the lines later.
-
-
-@dataclass
-class Schematic:
-    """Full parsed representation of one schematic XML document."""
-
-    image_name: str
-    width: int
-    height: int
-    components: list[Component] = field(default_factory=list)
-    lines: list[Line] = field(default_factory=list)
-
-
-# ---------------------------------------------------------------------------
-# Main reconstructor class
-# ---------------------------------------------------------------------------
+from schematic import BoundingBox, Component, Label, Line, Schematic
 
 
 class SchematicReconstructor:
