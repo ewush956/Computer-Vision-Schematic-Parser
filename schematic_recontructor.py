@@ -14,8 +14,10 @@ Typical usage
     reconstructor.export_image(canvas, "output_001.png")
 
 """
-
 from __future__ import annotations
+
+import xml.etree.ElementTree as ET
+
 from pathlib import Path
 from schematic import BoundingBox, Component, Label, Line, Schematic
 
@@ -42,7 +44,45 @@ class SchematicReconstructor:
         ----------
         xml_path : path to the .xml file produced by convert_detections_to_xml()
         """
-        ...
+
+        xml_path = Path(xml_path)
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+        print(root)
+        width = int(root.get("width", "0"))
+        height = int(root.get("height", "0"))
+
+        components = []
+        for component in root.findall("component"):
+            comp_id = int(component.get("id", "0"))
+            box_data = component.find("bounding_box")
+            class_name = component.get("class", "unknown")
+            confidence = float(component.get("conf", "0.0"))
+            box = BoundingBox(
+              xmin=int(box_data.get("xmin", "0")),
+              ymin=int(box_data.get("ymin", "0")),
+              xmax=int(box_data.get("xmax", "0")),
+              ymax=int(box_data.get("ymax", "0")),
+          )
+            components.append(
+              Component(
+                  id=comp_id,
+                  class_name=class_name,
+                  confidence=confidence,
+                  bounding_box=box,
+              )
+          )
+        print(components)
+        return Schematic(
+          id=0,
+          image_name=root.get("image_path", "unknown"),
+          width=width,
+          height=height,
+          components=components,
+          labels=[],
+          lines=[],
+      )
+
 
     # ------------------------------------------------------------------
     # 2. Filtering
@@ -264,3 +304,14 @@ class SchematicReconstructor:
         quality     : JPEG quality (1–100); ignored for lossless formats
         """
         ...
+
+
+
+def main():
+    # this main is just for testing.
+    recon = SchematicReconstructor()
+    recon.load_xml("./test.xml")
+
+
+if __name__ == "__main__":
+    main()

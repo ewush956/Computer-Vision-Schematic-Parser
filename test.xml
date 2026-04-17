@@ -1,5 +1,5 @@
 <?xml version='1.0' encoding='utf-8'?>
-<schematic width="4160" height="3120">
+<schematic width="4160" height="3120" image_path="archive-2/drafter_2/images/C18_D1_P2.jpg">
   <component id="0" class="voltage.ac" conf="0.9329773187637329">
     <bounding_box xmin="284" ymin="1454" xmax="593" ymax="1724" />
   </component>

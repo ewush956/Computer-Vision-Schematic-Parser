@@ -3,7 +3,6 @@ from pathlib import Path
 from ultralytics import YOLO
 import xml.etree.ElementTree as ET
 from ultralytics.engine.results import Results
-import ultralytics
 
 def run_detection(model_path: str, image_path: str, conf: float, save_result: bool) ->Results:
     """
@@ -34,7 +33,7 @@ def run_detection(model_path: str, image_path: str, conf: float, save_result: bo
     return results[0]
 
 
-def write_schematic_xml(result: Results, output_xml_path: str) -> None:
+def write_schematic_xml(result: Results, input_image_path:str, output_xml_path: str) -> None:
     """
     Converts YOLO detection results into a custom 'schematic' XML format.
 
@@ -50,6 +49,8 @@ def write_schematic_xml(result: Results, output_xml_path: str) -> None:
           {
               "width": str(w),
               "height": str(h),
+              "image_path": input_image_path
+
           },
       )
     for i, b in enumerate(boxes):
@@ -90,7 +91,7 @@ def main():
     result = run_detection(
         "./yolo-models/best.pt", "archive-2/drafter_2/images/C18_D1_P2.jpg", 0.5, False
     )
-    write_schematic_xml(result, "test.xml")
+    write_schematic_xml(result, "archive-2/drafter_2/images/C18_D1_P2.jpg", "test.xml")
 
 
 if __name__ == "__main__":
