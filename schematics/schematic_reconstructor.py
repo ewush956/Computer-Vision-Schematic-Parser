@@ -16,21 +16,38 @@ Typical usage
 """
 
 from __future__ import annotations
+
+import xml.etree.ElementTree as ET
 from pathlib import Path
-from schematic import BoundingBox, Component, Label, Line, Schematic
+
+from schematics.schematic import BoundingBox, Component, Label, Line, Schematic
+import numpy as np
+import cv2
 
 
 class SchematicReconstructor:
-
-    def __init__(self, confidence_threshold: float = 0.30) -> None:
+    def __init__(
+        self,
+        confidence_threshold: float = 0.30,
+        text_link_distance: float = 50.0,
+        connection_distance: float = 30.0,
+    ):
         self.confidence_threshold = confidence_threshold
+        self.text_link_distance = text_link_distance
+        self.connection_distance = connection_distance
 
-    # ------------------------------------------------------------------
-    # 1. Ingestion
-    # ------------------------------------------------------------------
+    def reconstruct(
+        self,
+        xml: ET.ElementTree | ET.Element,
+        polyLines,
+        image_path: str | None = None,
+    ):
+        schematic = self.load_xml(xml)
+        schematic = self.connect_components(schematic, polyLines)
+        return schematic
 
     # DEPANSHU: Parse XML into data model — entry point for all bounding box coordinate data
-    def load_xml(self, xml_path: str | Path) -> Schematic:
+    def load_xml(self, xml: ET.ElementTree) -> Schematic:
         """
         Parse a pipeline-generated XML file and return a Schematic object.
 
@@ -42,7 +59,39 @@ class SchematicReconstructor:
         ----------
         xml_path : path to the .xml file produced by convert_detections_to_xml()
         """
-        ...
+        root = xml.getroot() if hasattr(xml, "getroot") else xml
+        width = int(root.get("width", "0"))
+        height = int(root.get("height", "0"))
+
+        components = []
+        for component in root.findall("component"):
+            comp_id = int(component.get("id", "0"))
+            box_data = component.find("bounding_box")
+            class_name = component.get("class", "unknown")
+            confidence = float(component.get("conf", "0.0"))
+            box = BoundingBox(
+                xmin=int(box_data.get("xmin", "0")),
+                ymin=int(box_data.get("ymin", "0")),
+                xmax=int(box_data.get("xmax", "0")),
+                ymax=int(box_data.get("ymax", "0")),
+            )
+            components.append(
+                Component(
+                    id=comp_id,
+                    class_name=class_name,
+                    confidence=confidence,
+                    bounding_box=box,
+                )
+            )
+        return Schematic(
+            id=0,
+            image_name=root.get("image_path", "unknown"),
+            width=width,
+            height=height,
+            components=components,
+            labels=[],
+            lines=[],
+        )
 
     # ------------------------------------------------------------------
     # 2. Filtering
@@ -137,25 +186,81 @@ class SchematicReconstructor:
 
     # DEPANSHU: Determine which components are electrically connected based on proximity
     # Feel free to do this however you want, this is just a thought on how you could go about it.
-    def connect_components(
-        self,
-        schematic: Schematic,
-        max_distance_px: float = 30.0,
-    ) -> Schematic:
-        """
-        Identify pairs of components whose bounding boxes are within
-        max_distance_px of each other and record them as Line objects
-        on the returned Schematic.
+    def connect_components(self, schematic, polyLines, strict_margin=30):
+        schematic.lines = []
 
-        Returns a new Schematic with the lines list populated;
-        the original is not mutated.
+        for line_id, polyline in enumerate(polyLines):
+            if len(polyline) < 2:
+                continue
 
-        Parameters
-        ----------
-        schematic       : filtered Schematic (text components already removed)
-        max_distance_px : maximum edge-to-edge distance to form a connection
-        """
-        ...
+            start = polyline[0]
+            end = polyline[-1]
+
+            start_match = self.nearest_component_box(
+                start,
+                schematic.components,
+                strict_margin,
+            )
+
+            end_match = self.nearest_component_box(
+                end,
+                schematic.components,
+                strict_margin,
+            )
+
+            if start_match and end_match and start_match.id != end_match.id:
+                status = "connected"
+                from_id = start_match.id
+                to_id = end_match.id
+
+            elif start_match or end_match:
+                status = "dangling"
+                from_id = start_match.id if start_match else None
+                to_id = end_match.id if end_match else None
+
+            else:
+                status = "orphan"
+                from_id = None
+                to_id = None
+
+            schematic.lines.append(
+                Line(
+                    id=line_id,
+                    from_id=from_id,
+                    to_id=to_id,
+                    status=status,
+                    polyline=[(int(x), int(y)) for x, y in polyline],
+                )
+            )
+
+        return schematic
+
+    def point_to_box_distance(self, point, box):
+        x, y = point
+
+        dx = max(box.xmin - x, 0, x - box.xmax)
+        dy = max(box.ymin - y, 0, y - box.ymax)
+
+        return (dx * dx + dy * dy) ** 0.5
+
+    def nearest_component_box(self, point, components, strict_margin=30):
+        best_component = None
+        best_distance = float("inf")
+
+        for component in components:
+            if component.class_name.lower() == "text":
+                continue
+
+            distance = self.point_to_box_distance(point, component.bounding_box)
+
+            if distance < best_distance:
+                best_component = component
+                best_distance = distance
+
+        if best_component is not None and best_distance <= strict_margin:
+            return best_component
+
+        return None
 
     # ------------------------------------------------------------------
     # 5. Canvas & rendering
@@ -264,3 +369,79 @@ class SchematicReconstructor:
         quality     : JPEG quality (1–100); ignored for lossless formats
         """
         ...
+
+
+def visualize_schematic(schematic, output_path="output/schematic_graph.png"):
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    canvas = np.full((schematic.height, schematic.width, 3), 255, dtype=np.uint8)
+    components_by_id = {component.id: component for component in schematic.components}
+
+    status_colors = {
+        "connected": (0, 180, 0),
+        "dangling": (0, 0, 255),
+        "orphan": (160, 160, 160),
+        "repaired": (255, 180, 0),
+    }
+
+    for line in schematic.lines:
+        if line.status != "connected":
+            continue
+        color = status_colors.get(line.status, (0, 0, 0))
+
+        if len(line.polyline) >= 2:
+            points = np.array(line.polyline, dtype=np.int32).reshape(-1, 1, 2)
+            cv2.polylines(
+                canvas,
+                [points],
+                isClosed=False,
+                color=color,
+                thickness=2,
+                lineType=cv2.LINE_AA,
+            )
+            continue
+
+        if line.from_id is None or line.to_id is None:
+            continue
+
+        from_component = components_by_id[line.from_id]
+        to_component = components_by_id[line.to_id]
+
+        p1 = (
+            int(from_component.bounding_box.center_x),
+            int(from_component.bounding_box.center_y),
+        )
+        p2 = (
+            int(to_component.bounding_box.center_x),
+            int(to_component.bounding_box.center_y),
+        )
+
+        cv2.line(canvas, p1, p2, color, 2, cv2.LINE_AA)
+
+    for component in schematic.components:
+        if component.class_name.lower() == "text":
+            continue
+
+        box = component.bounding_box
+        cv2.rectangle(
+            canvas,
+            (box.xmin, box.ymin),
+            (box.xmax, box.ymax),
+            (0, 180, 255),
+            2,
+        )
+
+        cv2.putText(
+            canvas,
+            component.class_name,
+            (box.xmin, max(15, box.ymin - 5)),
+            cv2.FONT_HERSHEY_TRIPLEX,
+            0.45,
+            (0, 0, 0),
+            1,
+            cv2.LINE_AA,
+        )
+
+    cv2.imwrite(str(output_path), canvas)
+

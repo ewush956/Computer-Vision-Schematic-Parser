@@ -161,5 +161,7 @@ cython_debug/
 
 data/*
 
-.venv/
-.envrc
+models/*
+archive-2/*
+output/*
+runs/*
