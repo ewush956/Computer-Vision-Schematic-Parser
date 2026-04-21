@@ -143,14 +143,17 @@ def sliding_window_inference(
     with torch.no_grad():
         for i in range(0, len(tensors), batch_size):
             batch = tensors[i : i + batch_size].to(DEVICE)
-            with torch.autocast(device_type=DEVICE):
-                preds_all.append(torch.sigmoid(model(batch)).squeeze(1).float().cpu())
+            preds_all.append(torch.sigmoid(model(batch)).squeeze(1).float().cpu())
     preds_all = torch.cat(preds_all).numpy()  # (N, H, W)
 
     for (y, x), pred in zip(coords, preds_all):
         pred_r = cv2.resize(pred, (patch, patch))
-        accum[y : y + patch, x : x + patch] += pred_r
-        count[y : y + patch, x : x + patch] += 1
+        y_end = min(y + patch, h)
+        x_end = min(x + patch, w)
+        ph = y_end - y
+        pw = x_end - x
+        accum[y:y_end, x:x_end] += pred_r[:ph, :pw]
+        count[y:y_end, x:x_end] += 1
 
     prob_map = accum / np.maximum(count, 1)
     return ((prob_map > threshold) * 255).astype(np.uint8)

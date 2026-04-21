@@ -68,7 +68,7 @@ class SchematicReconstructor:
             comp_id = int(component.get("id", "0"))
             box_data = component.find("bounding_box")
             class_name = component.get("class", "unknown")
-            confidence = float(component.get("conf", "0.0"))
+            confidence = float(component.get("confidence", "0.0"))
             box = BoundingBox(
                 xmin=int(box_data.get("xmin", "0")),
                 ymin=int(box_data.get("ymin", "0")),
@@ -109,8 +109,17 @@ class SchematicReconstructor:
         ----------
         threshold : defaults to self.confidence_threshold if not provided
         """
-        threshold = threshold or self.confidence_threshold
-        ...
+        threshold = threshold if threshold is not None else self.confidence_threshold
+        kept = [c for c in schematic.components if c.confidence >= threshold]
+        return Schematic(
+            id=schematic.id,
+            image_name=schematic.image_name,
+            width=schematic.width,
+            height=schematic.height,
+            components=kept,
+            labels=list(schematic.labels),
+            lines=list(schematic.lines),
+        )
 
     # AMTOJ: Isolate or remove component types — used to strip "text" detections after linking
     def filter_by_class(
@@ -129,34 +138,20 @@ class SchematicReconstructor:
         class_names : list of class names to keep or drop
         exclude     : if True, drop the named classes instead of keeping them
         """
-        ...
-
-    # ------------------------------------------------------------------
-    # 3. Coordinate access
-    # ------------------------------------------------------------------
-
-    # DEPANSHU: Return the center coordinate of a component
-    def get_center(self, component: Component) -> tuple[float, float]:
-        """
-        Return the (x, y) center of a component's bounding box.
-
-        Parameters
-        ----------
-        component : any Component from a loaded Schematic
-        """
-        ...
-
-    # DEPANSHU: Return the bounding coordinates of a component as a plain tuple
-    def get_bounds(self, component: Component) -> tuple[int, int, int, int]:
-        """
-        Return (xmin, ymin, xmax, ymax) for a component.
-        Shields all callers from direct BoundingBox access.
-
-        Parameters
-        ----------
-        component : any Component from a loaded Schematic
-        """
-        ...
+        names = set(class_names)
+        if exclude:
+            kept = [c for c in schematic.components if c.class_name not in names]
+        else:
+            kept = [c for c in schematic.components if c.class_name in names]
+        return Schematic(
+            id=schematic.id,
+            image_name=schematic.image_name,
+            width=schematic.width,
+            height=schematic.height,
+            components=kept,
+            labels=list(schematic.labels),
+            lines=list(schematic.lines),
+        )
 
     # ------------------------------------------------------------------
     # 4. Text & component linking
@@ -182,7 +177,79 @@ class SchematicReconstructor:
         schematic       : Schematic still containing "text" components
         max_distance_px : maximum center-to-center distance to form a link
         """
-        ...
+        text_components = [c for c in schematic.components if c.class_name.lower() == "text"]
+        non_text = [c for c in schematic.components if c.class_name.lower() != "text"]
+
+        # Copy non-text components so we don't mutate the input Schematic.
+        new_components: dict[int, Component] = {
+            c.id: Component(
+                id=c.id,
+                class_name=c.class_name,
+                confidence=c.confidence,
+                bounding_box=c.bounding_box,
+                label=c.label,
+            )
+            for c in non_text
+        }
+
+        new_labels: list[Label] = list(schematic.labels)
+
+        for text_comp in text_components:
+            tx, ty = self.get_center(text_comp)
+
+            best_target = None
+            best_dist = float("inf")
+            for target in non_text:
+                cx, cy = self.get_center(target)
+                dist = ((tx - cx) ** 2 + (ty - cy) ** 2) ** 0.5
+                if dist < best_dist:
+                    best_dist = dist
+                    best_target = target
+
+            if best_target is None or best_dist > max_distance_px:
+                continue
+
+            label = Label(
+                id=text_comp.id,
+                raw_text=text_comp.class_name,
+                confidence=text_comp.confidence,
+                bounding_box=text_comp.bounding_box,
+                semantic_type=None,
+            )
+            new_labels.append(label)
+            new_components[best_target.id].label = label
+
+        # Preserve original component order (keep "text" components too).
+        rebuilt = []
+        for c in schematic.components:
+            if c.id in new_components:
+                rebuilt.append(new_components[c.id])
+            else:
+                rebuilt.append(c)
+
+        return Schematic(
+            id=schematic.id,
+            image_name=schematic.image_name,
+            width=schematic.width,
+            height=schematic.height,
+            components=rebuilt,
+            labels=new_labels,
+            lines=list(schematic.lines),
+        )
+
+    # ------------------------------------------------------------------
+    # Geometry helpers
+    # ------------------------------------------------------------------
+
+    def get_center(self, component: Component) -> tuple[float, float]:
+        """Return (cx, cy) center of the component's bounding box."""
+        box = component.bounding_box
+        return (box.center_x, box.center_y)
+
+    def get_bounds(self, component: Component) -> tuple[int, int, int, int]:
+        """Return (xmin, ymin, xmax, ymax) for the component's bounding box."""
+        box = component.bounding_box
+        return (box.xmin, box.ymin, box.xmax, box.ymax)
 
     # DEPANSHU: Determine which components are electrically connected based on proximity
     # Feel free to do this however you want, this is just a thought on how you could go about it.
@@ -278,7 +345,9 @@ class SchematicReconstructor:
         schematic : provides the canvas dimensions
         scale     : resize factor; 1.0 = original pixel dimensions
         """
-        ...
+        width = max(1, int(schematic.width * scale))
+        height = max(1, int(schematic.height * scale))
+        return np.full((height, width, 3), 255, dtype=np.uint8)
 
     # EVAN: Draw each detected component as a coloured bounding box on the canvas
     def draw_components(self, canvas, schematic: Schematic) -> None:
@@ -292,7 +361,88 @@ class SchematicReconstructor:
         canvas    : the canvas returned by render_canvas()
         schematic : filtered Schematic whose component boxes will be drawn
         """
-        ...
+        symbol_dir = Path("assets/symbols")
+
+        # Precompute each component's preferred orientation from the wires
+        # that terminate on it. Uses schematic.lines (populated by
+        # connect_components) so we don't need to know about drawing order.
+        orientations = self._component_orientations(schematic)
+
+        for component in schematic.components:
+            class_name = component.class_name.lower()
+            if class_name == "text":
+                continue
+
+            xmin, ymin, xmax, ymax = self.get_bounds(component)
+            w = max(1, xmax - xmin)
+            h = max(1, ymax - ymin)
+
+            # Clip to canvas bounds.
+            canvas_h, canvas_w = canvas.shape[:2]
+            x0, y0 = max(0, xmin), max(0, ymin)
+            x1, y1 = min(canvas_w, xmax), min(canvas_h, ymax)
+            if x1 <= x0 or y1 <= y0:
+                continue
+
+            # Junctions are wire-branch dots, not full symbols.
+            if class_name == "junction":
+                cx = (xmin + xmax) // 2
+                cy = (ymin + ymax) // 2
+                radius = max(2, min(w, h) // 4)
+                cv2.circle(canvas, (cx, cy), radius, (0, 0, 0), thickness=-1)
+                continue
+
+            orientation = orientations.get(component.id, "horizontal")
+            primary = symbol_dir / f"{component.class_name}_{orientation}.png"
+            fallback = symbol_dir / (
+                f"{component.class_name}_"
+                f"{'vertical' if orientation == 'horizontal' else 'horizontal'}.png"
+            )
+            symbol_path = primary if primary.exists() else fallback
+            symbol = None
+            if symbol_path.exists():
+                symbol = cv2.imread(str(symbol_path), cv2.IMREAD_UNCHANGED)
+
+            if symbol is not None:
+                # Composite RGBA onto white -> BGR
+                if symbol.ndim == 3 and symbol.shape[2] == 4:
+                    bgr = symbol[..., :3].astype(np.float32)
+                    alpha = symbol[..., 3:4].astype(np.float32) / 255.0
+                    white = np.full_like(bgr, 255.0)
+                    bgr = (bgr * alpha + white * (1.0 - alpha)).astype(np.uint8)
+                elif symbol.ndim == 2:
+                    bgr = cv2.cvtColor(symbol, cv2.COLOR_GRAY2BGR)
+                else:
+                    bgr = symbol[..., :3]
+
+                # Letterbox: preserve aspect ratio, center inside the bounding box.
+                sym_h, sym_w = bgr.shape[:2]
+                scale = min(w / sym_w, h / sym_h)
+                new_w = max(1, int(round(sym_w * scale)))
+                new_h = max(1, int(round(sym_h * scale)))
+                resized = cv2.resize(bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+                # Placement in image coordinates, centered inside [xmin..xmax, ymin..ymax].
+                px0 = xmin + (w - new_w) // 2
+                py0 = ymin + (h - new_h) // 2
+                px1 = px0 + new_w
+                py1 = py0 + new_h
+
+                # Clip to canvas bounds, tracking source offsets.
+                dx0 = max(px0, 0)
+                dy0 = max(py0, 0)
+                dx1 = min(px1, canvas_w)
+                dy1 = min(py1, canvas_h)
+                if dx1 <= dx0 or dy1 <= dy0:
+                    continue
+                sx0 = dx0 - px0
+                sy0 = dy0 - py0
+                sx1 = sx0 + (dx1 - dx0)
+                sy1 = sy0 + (dy1 - dy0)
+                canvas[dy0:dy1, dx0:dx1] = resized[sy0:sy1, sx0:sx1]
+            else:
+                color = self._class_color(component.class_name)
+                cv2.rectangle(canvas, (x0, y0), (x1, y1), color, 2)
 
     # EVAN: Draw arrows between connected components on the canvas
     def draw_lines(self, canvas, schematic: Schematic) -> None:
@@ -306,7 +456,48 @@ class SchematicReconstructor:
         canvas    : canvas already passed through draw_components()
         schematic : Schematic whose lines list will be rendered
         """
-        ...
+        components_by_id = {c.id: c for c in schematic.components}
+
+        for line in schematic.lines:
+            if line.status not in ("connected", "dangling"):
+                continue
+            if len(line.polyline) < 2:
+                continue
+
+            start = line.polyline[0]
+            end = line.polyline[-1]
+
+            # Snap each endpoint onto the matched component's bounding box edge
+            # so the wire visibly terminates at the component. Unmatched ends of
+            # dangling wires are left at the traced endpoint.
+            from_comp = components_by_id.get(line.from_id)
+            to_comp = components_by_id.get(line.to_id)
+            if from_comp is not None:
+                start = self._snap_to_box_edge(start, from_comp.bounding_box)
+            if to_comp is not None:
+                end = self._snap_to_box_edge(end, to_comp.bounding_box)
+
+            # Manhattan Z-route between the (snapped) endpoints.
+            x0, y0 = start
+            x1, y1 = end
+            dx = abs(x1 - x0)
+            dy = abs(y1 - y0)
+            if dx >= dy:
+                mid_x = (x0 + x1) // 2
+                route = [(x0, y0), (mid_x, y0), (mid_x, y1), (x1, y1)]
+            else:
+                mid_y = (y0 + y1) // 2
+                route = [(x0, y0), (x0, mid_y), (x1, mid_y), (x1, y1)]
+
+            points = np.array(route, dtype=np.int32).reshape(-1, 1, 2)
+            cv2.polylines(
+                canvas,
+                [points],
+                isClosed=False,
+                color=(0, 0, 0),
+                thickness=1,
+                lineType=cv2.LINE_8,
+            )
 
     # AMTOJ: Resolve label text for linked components
     # EVAN: Render the label overlay onto the canvas
@@ -315,7 +506,7 @@ class SchematicReconstructor:
         self,
         canvas,
         schematic: Schematic,
-        show_confidence: bool = True,
+        show_confidence: bool = False,
     ) -> None:
         """
         Overlay a text label on each bounding box drawn by draw_components().
@@ -330,7 +521,56 @@ class SchematicReconstructor:
         schematic       : the same Schematic used in draw_components()
         show_confidence : whether to append "(0.87)" to each label
         """
-        ...
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.32
+        thickness = 1
+        pad = 1
+        canvas_h, canvas_w = canvas.shape[:2]
+
+        for component in schematic.components:
+            if component.class_name.lower() in ("text", "junction"):
+                continue
+
+            # Prefer a linked label, but skip the placeholder "text" raw_text
+            # that leaks through when no OCR is present.
+            if component.label is not None and component.label.raw_text.lower() != "text":
+                text = component.label.raw_text
+            else:
+                text = component.class_name
+
+            if show_confidence:
+                text = f"{text} ({component.confidence:.2f})"
+
+            xmin, ymin, xmax, ymax = self.get_bounds(component)
+            (tw, th), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+            box_h = th + pad * 2
+
+            # Prefer above-the-box; fall back to inside-the-top when there's no room.
+            bg_x0 = xmin
+            bg_x1 = min(canvas_w, bg_x0 + tw + pad * 2)
+            if ymin - box_h >= 0:
+                bg_y0 = ymin - box_h
+            else:
+                bg_y0 = ymin
+            bg_y1 = bg_y0 + box_h
+
+            cv2.rectangle(
+                canvas,
+                (bg_x0, bg_y0),
+                (bg_x1, bg_y1),
+                (0, 0, 0),
+                thickness=-1,
+            )
+            cv2.putText(
+                canvas,
+                text,
+                (bg_x0 + pad, bg_y1 - pad),
+                font,
+                font_scale,
+                (255, 255, 255),
+                thickness,
+                cv2.LINE_AA,
+            )
 
     # ------------------------------------------------------------------
     # 6. Summary
@@ -345,7 +585,12 @@ class SchematicReconstructor:
 
         Used to populate the legend panel in the GUI.
         """
-        ...
+        counts: dict[str, int] = {}
+        for component in schematic.components:
+            if component.class_name.lower() in ("text", "junction"):
+                continue
+            counts[component.class_name] = counts.get(component.class_name, 0) + 1
+        return counts
 
     # ------------------------------------------------------------------
     # 7. Export
@@ -368,7 +613,90 @@ class SchematicReconstructor:
         output_path : destination file path
         quality     : JPEG quality (1–100); ignored for lossless formats
         """
-        ...
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        ext = output_path.suffix.lower()
+        params: list[int] = []
+        if ext in (".jpg", ".jpeg"):
+            params = [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)]
+
+        cv2.imwrite(str(output_path), canvas, params)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _component_orientations(self, schematic: Schematic) -> dict[int, str]:
+        """Vote per-component on whether wires enter horizontally or vertically.
+
+        For each wire endpoint that terminates at a component (from_id/to_id),
+        compare the endpoint's horizontal-vs-vertical offset from the box
+        center. The larger axis wins a vote for that orientation. Components
+        with no incident wires default to 'horizontal'.
+        """
+        votes: dict[int, tuple[int, int]] = {}  # id -> (horiz, vert)
+        components_by_id = {c.id: c for c in schematic.components}
+
+        def cast_vote(comp_id: int, point: tuple[int, int]) -> None:
+            comp = components_by_id.get(comp_id)
+            if comp is None:
+                return
+            box = comp.bounding_box
+            cx = (box.xmin + box.xmax) / 2.0
+            cy = (box.ymin + box.ymax) / 2.0
+            h, v = votes.get(comp_id, (0, 0))
+            if abs(point[0] - cx) >= abs(point[1] - cy):
+                h += 1
+            else:
+                v += 1
+            votes[comp_id] = (h, v)
+
+        for line in schematic.lines:
+            if not line.polyline:
+                continue
+            if line.from_id is not None:
+                cast_vote(line.from_id, line.polyline[0])
+            if line.to_id is not None:
+                cast_vote(line.to_id, line.polyline[-1])
+
+        result: dict[int, str] = {}
+        for comp_id, (h, v) in votes.items():
+            result[comp_id] = "horizontal" if h >= v else "vertical"
+        return result
+
+    def _snap_to_box_edge(
+        self, point: tuple[int, int], box: BoundingBox
+    ) -> tuple[int, int]:
+        """Project ``point`` onto the closest point of the bounding-box perimeter.
+
+        For points outside the box this clamps both coordinates into range, which
+        lands on whichever side/corner of the box is nearest. For points inside
+        the box, push to the nearest edge so the wire appears to terminate at
+        the symbol outline rather than disappearing into it.
+        """
+        x, y = point
+        cx = max(box.xmin, min(int(x), box.xmax))
+        cy = max(box.ymin, min(int(y), box.ymax))
+        inside = box.xmin < cx < box.xmax and box.ymin < cy < box.ymax
+        if inside:
+            edges = (
+                (cx - box.xmin, (box.xmin, cy)),
+                (box.xmax - cx, (box.xmax, cy)),
+                (cy - box.ymin, (cx, box.ymin)),
+                (box.ymax - cy, (cx, box.ymax)),
+            )
+            _, snapped = min(edges, key=lambda e: e[0])
+            return (int(snapped[0]), int(snapped[1]))
+        return (int(cx), int(cy))
+
+    def _class_color(self, class_name: str) -> tuple[int, int, int]:
+        """Deterministic BGR color keyed off the class name."""
+        h = hash(class_name) & 0xFFFFFF
+        b = 60 + (h & 0xFF) % 180
+        g = 60 + ((h >> 8) & 0xFF) % 180
+        r = 60 + ((h >> 16) & 0xFF) % 180
+        return (int(b), int(g), int(r))
 
 
 def visualize_schematic(schematic, output_path="output/schematic_graph.png"):
@@ -445,3 +773,92 @@ def visualize_schematic(schematic, output_path="output/schematic_graph.png"):
 
     cv2.imwrite(str(output_path), canvas)
 
+
+if __name__ == "__main__":
+    # Full reconstruction pipeline on tests/images/testcase1.png.
+    import argparse
+
+    from detectors.wire_detect import detect_wires
+    from detectors.yolo_detection import detect_and_export_to_xml
+
+    WIRE_MODEL = "models/unet_best.pth"
+    YOLO_MODEL = "models/yolo.pt"
+
+    arg_parser = argparse.ArgumentParser(description="Reconstruct a schematic image.")
+    arg_parser.add_argument(
+        "--image",
+        type=Path,
+        default=None,
+        help="Input schematic image. If omitted, all .png/.jpg in tests/images/ are processed.",
+    )
+    arg_parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Output image path (single-image mode only; default: tests/outputs/<stem>_reconstructed.png).",
+    )
+    labels_group = arg_parser.add_mutually_exclusive_group()
+    labels_group.add_argument(
+        "--labels",
+        dest="labels",
+        action="store_true",
+        help="Draw component labels (default).",
+    )
+    labels_group.add_argument(
+        "--no-labels",
+        dest="labels",
+        action="store_false",
+        help="Skip drawing labels.",
+    )
+    arg_parser.set_defaults(labels=True)
+    args = arg_parser.parse_args()
+
+    if args.image is not None:
+        images = [args.image]
+    else:
+        images_dir = Path("tests/images")
+        images = sorted(
+            p
+            for p in images_dir.iterdir()
+            if p.suffix.lower() in (".png", ".jpg", ".jpeg")
+        )
+        if not images:
+            raise SystemExit(f"No .png/.jpg images found in {images_dir}")
+
+    reconstructor = SchematicReconstructor()
+    suffix = "_reconstructed" if args.labels else "_nolabels"
+
+    for image_path in images:
+        if args.output is not None and len(images) == 1:
+            output_path = args.output
+        else:
+            output_path = Path(f"tests/outputs/{image_path.stem}{suffix}.png")
+
+        component_xml = detect_and_export_to_xml(
+            model_path=YOLO_MODEL,
+            image_path=str(image_path),
+            output_xml_path=f"output/{image_path.stem}.xml",
+        )
+
+        _cleaned, _erased, _skeleton, polylines = detect_wires(
+            image_path, component_xml.getroot(), WIRE_MODEL
+        )
+
+        schematic = reconstructor.reconstruct(component_xml, polylines, str(image_path))
+        schematic = reconstructor.filter_by_confidence(schematic)
+        schematic = reconstructor.link_text_to_components(schematic)
+        # Keep junctions — they're rendered as connection dots; only drop text.
+        schematic = reconstructor.filter_by_class(schematic, ["text"], exclude=True)
+
+        canvas = reconstructor.render_canvas(schematic)
+        reconstructor.draw_components(canvas, schematic)
+        reconstructor.draw_lines(canvas, schematic)
+        if args.labels:
+            reconstructor.annotate_labels(canvas, schematic)
+        reconstructor.export_image(canvas, output_path)
+
+        print(
+            f"Wrote {output_path}  (labels={'on' if args.labels else 'off'}, "
+            f"polylines={len(polylines)})"
+        )
+        print(f"  Counts: {reconstructor.summarise(schematic)}")

@@ -54,7 +54,7 @@ def detect_and_export_to_xml(
         component = ET.SubElement(
             root,
             "component",
-            {"id": str(i), "class": class_names[cls_id], "conf": str(conf)},
+            {"id": str(i), "class": class_names[cls_id], "confidence": str(conf)},
         )
         ET.SubElement(
             component,

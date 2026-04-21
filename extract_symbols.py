@@ -94,9 +94,9 @@ YOLO_TO_SVG_ID: dict[str, str | None] = {
     "xor": "g165-6-9",  # OR + extra input curve
     "not": "g166",  # triangle + bubble
     # ── Probes / meters ───────────────────────────────────────────────────────
-    "probe": None,  # Generic/galvanometer
-    "probe.current": None,  # not in dataset
-    "probe.voltage": None,  # ArtOfElectronics/voltmeter
+    "probe": "path1156",  # Generic/galvanometer
+    "probe.current": "path1156",  # not in dataset
+    "probe.voltage": "path1156",  # ArtOfElectronics/voltmeter
     # ── Electromechanical ─────────────────────────────────────────────────────
     "switch": "g1739-9-4",  # Generic/switch
     "relay": None,  # IEEE315/relay
@@ -133,6 +133,16 @@ def export_symbol(svg_file: Path, element_id: str, out_file: Path, dpi: int) -> 
     return result.returncode == 0 and out_file.exists() and out_file.stat().st_size > 0
 
 
+def make_vertical_copy(horizontal_file: Path, vertical_file: Path) -> bool:
+    """Create a 90°-rotated (vertical) duplicate of a horizontal symbol PNG."""
+    from PIL import Image
+
+    with Image.open(horizontal_file) as img:
+        rotated = img.rotate(90, expand=True)
+        rotated.save(vertical_file)
+    return vertical_file.exists() and vertical_file.stat().st_size > 0
+
+
 def run_extraction() -> None:
     if not SVG_FILE.exists():
         print(f"ERROR: {SVG_FILE} not found.")
@@ -149,7 +159,8 @@ def run_extraction() -> None:
     print(f"Extracting {total} symbol classes from {SVG_FILE.name} …\n")
 
     for yolo_class, svg_id in sorted(YOLO_TO_SVG_ID.items()):
-        out_file = OUT_DIR / f"{yolo_class}.png"
+        horizontal_file = OUT_DIR / f"{yolo_class}_horizontal.png"
+        vertical_file = OUT_DIR / f"{yolo_class}_vertical.png"
 
         if svg_id is None:
             skipped.append(yolo_class)
@@ -157,12 +168,23 @@ def run_extraction() -> None:
             continue
 
         print(f"  ...    {yolo_class:<45}  [{svg_id}]", end="", flush=True)
-        success = export_symbol(SVG_FILE, svg_id, out_file, EXPORT_DPI)
+        success = export_symbol(SVG_FILE, svg_id, horizontal_file, EXPORT_DPI)
 
         if success:
+            try:
+                make_vertical_copy(horizontal_file, vertical_file)
+            except Exception as e:
+                failed.append((yolo_class, svg_id))
+                print(f"  FAIL (rotate: {e})")
+                continue
+
             ok.append(yolo_class)
-            size = out_file.stat().st_size // 1024
-            print(f"  →  {out_file.name}  ({size} KB)")
+            h_kb = horizontal_file.stat().st_size // 1024
+            v_kb = vertical_file.stat().st_size // 1024
+            print(
+                f"  →  {horizontal_file.name} ({h_kb} KB) + "
+                f"{vertical_file.name} ({v_kb} KB)"
+            )
         else:
             failed.append((yolo_class, svg_id))
             print(f"  FAIL")
