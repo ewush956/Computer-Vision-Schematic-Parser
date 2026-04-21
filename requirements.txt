@@ -1,0 +1,15 @@
+torch>=2.0.0
+torchvision>=0.15.0
+ultralytics>=8.2.0
+pycocotools>=2.0.7
+opencv-python>=4.9.0
+tqdm>=4.66.0
+kaggle>=1.6.0
+seaborn
+numpy
+pandas
+Pillow
+shapely
+segmentation-models-pytorch
+albumentations
+scikit-image>=0.23.0
