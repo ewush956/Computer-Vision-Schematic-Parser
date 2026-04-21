@@ -5,8 +5,10 @@ from semantic_parser import SchematicTextClassifier
 
 
 def process_schematic_text(image_path, xml_path):
-    print("Loading AI Models...")
+    print("Loading Models...")
+
     reader = easyocr.Reader(['en'], verbose=False)
+
     classifier = SchematicTextClassifier()
     
     print(f"Loading Image: {image_path}")
