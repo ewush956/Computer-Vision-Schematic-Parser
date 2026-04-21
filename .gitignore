@@ -161,5 +161,7 @@ cython_debug/
 
 data/*
 
-yolo-models/*
+models/*
 archive-2/*
+output/*
+runs/*

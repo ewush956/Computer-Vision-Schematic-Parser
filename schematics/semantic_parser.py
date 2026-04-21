@@ -177,4 +177,3 @@ class SchematicTextClassifier:
             return "value"
 
         return None
-

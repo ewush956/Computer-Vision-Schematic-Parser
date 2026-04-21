@@ -50,11 +50,13 @@ class Component:
 
 @dataclass
 class Line:
-    """A directed connection between two components."""
+    """A traced wire, with optional matched component endpoints."""
 
     id: int
-    from_id: int
-    to_id: int
+    from_id: int | None
+    to_id: int | None
+    status: str
+    polyline: list[tuple[int, int]] = field(default_factory=list)
 
 
 @dataclass
