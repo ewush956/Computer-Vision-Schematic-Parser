@@ -8,34 +8,16 @@ from PIL import Image
 import huggingface_hub.utils._validators as hf_validators
 import os
 
-#MODEL_DIR = Path(__file__).parent / 'trocr-schematic-final'
-# processor = TrOCRProcessor.from_pretrained('./trocr-schematic-final')
-# trocr_model = VisionEncoderDecoderModel.from_pretrained('./trocr-schematic-final')
-
-script_dir = os.path.dirname(os.path.abspath(__file__))
-# MODEL_DIR = os.path.join(script_dir, "trocrSchematicFinal")
-
-# MODEL_DIR = Path(script_dir) / "trocrSchematicFinal"
-# model_uri = MODEL_DIR.as_uri()
-# processor = TrOCRProcessor.from_pretrained(model_uri, local_files_only=True)
-# trocr_model = VisionEncoderDecoderModel.from_pretrained(model_uri, local_files_only=True)
-
-# processor = TrOCRProcessor.from_pretrained(MODEL_DIR, local_files_only=True)
-# trocr_model = VisionEncoderDecoderModel.from_pretrained(MODEL_DIR, local_files_only=True)
-
 hf_validators.validate_repo_id = lambda repo_id: None
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
-MODEL_DIR = os.path.join(script_dir, "trocrSchematicFinal")
+# MODEL_DIR = os.path.join(script_dir, "trocrSchematicFinal")
+MODEL_DIR = os.path.join(script_dir, "trocrSchematicFinal").replace("\\", "/")
+print("MODEL_DIR:", MODEL_DIR)
+print("Files:", os.listdir(MODEL_DIR))
 
 processor = TrOCRProcessor.from_pretrained(MODEL_DIR, local_files_only=True)
 trocr_model = VisionEncoderDecoderModel.from_pretrained(MODEL_DIR, local_files_only=True)
-
-
-
-
-
-
 trocr_model.eval()
 
 
@@ -109,7 +91,7 @@ def process_schematic_with_yolo(image_path, model_path):
     if not Path(output_path).exists():
         results[0].save(output_path)
 
-IMAGE_FILE = 'images_and_xml/C159_D2_P1.jpg'
+IMAGE_FILE = 'images_and_xml/C-13_D1_P4.jpg'
 MODEL_FILE = './weights/best.pt'
 
 process_schematic_with_yolo(IMAGE_FILE, MODEL_FILE)
