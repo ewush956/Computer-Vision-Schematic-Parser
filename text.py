@@ -1,3 +1,12 @@
+
+
+
+
+
+
+# Ignore this file, just for my testing.
+# DO NOT USe 
+
 import cv2
 import easyocr
 import xml.etree.ElementTree as ET
