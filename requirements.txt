@@ -14,3 +14,4 @@ segmentation-models-pytorch
 albumentations
 scikit-image>=0.23.0
 easyocr
+transformers

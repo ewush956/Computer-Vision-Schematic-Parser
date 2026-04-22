@@ -29,6 +29,5 @@ def detect_components(model_path: str,
     )[0]
 
     if save_annotated:
-        Path("output").mkdir(exist_ok=True)
-    result.save(f"{save_directory}/yolo_output.png", line_width=1, labels=True, conf=False)
+        result.save(f"{save_directory}/yolo_output.png", line_width=1, labels=True, conf=False)
     return result

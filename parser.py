@@ -5,7 +5,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from model_inference.text_ocr import resolve_text_annotations
+from model_inference.text_ocr import process_schematic_with_yolo
 from model_inference.wire_detect import detect_wires
 from model_inference.yolo_detection import detect_components
 # from model_inference.text_ocr import resolve_text_annotations
@@ -15,7 +15,7 @@ from schematics.schematic_reconstructor import SchematicReconstructor, visualize
 
 WIRE_MODEL_PATH = "models/unet_best.pth"
 YOLO_MODEL_PATH = "models/yolo.pt"
-
+OCR_MODEL_DIR = "./models/trocrSchematicFinal"
 def draw_component_boxes(image_bgr: np.ndarray, schematic: Schematic) -> np.ndarray:
     output = image_bgr.copy()
 
@@ -111,7 +111,7 @@ def main(argv: list[str] | None = None) -> None:
     # Runs the yolo model and gives the component bounding boxes
     yolo_result = detect_components(YOLO_MODEL_PATH,img_path, save_annotated=True, save_directory= "./processing_steps")
     schematic = SchematicParser.from_yolo_to_schematic(yolo_result)
-    resolve_text_annotations(schematic)
+    schematic = process_schematic_with_yolo(schematic, OCR_MODEL_DIR)
 
 
     cleaned, erased, skeleton, polyLines = detect_wires(

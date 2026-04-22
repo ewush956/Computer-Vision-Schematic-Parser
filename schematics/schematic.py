@@ -33,8 +33,6 @@ class Component:
     ymin: int
     xmax: int
     ymax: int
-    # The last three are optional. They only count if the component is a text box
-    ocr_conf: float | None = None
     text: str | None = None
     text_type: str | None = None
 
@@ -127,7 +125,6 @@ class Schematic:
             xmax=xmax,
             ymax=ymax,
             text=text,
-            ocr_conf=ocr_conf,
             text_type=text_type,
         )
         self.components.append(component)
@@ -197,8 +194,6 @@ class SchematicParser:
             }
             if comp.text is not None:
                 attribs["text"] = comp.text
-            if comp.ocr_conf is not None:
-                attribs["ocr_conf"] = f"{comp.ocr_conf:.4f}"
             if comp.text_type is not None:
                 attribs["text_type"] = comp.text_type
 
