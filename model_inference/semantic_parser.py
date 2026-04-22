@@ -22,8 +22,8 @@ class SchematicTextClassifier:
             # Serial interfaces
             "RX", "TX", "MOSI", "MISO", "SCK",
             # BJT / FET / diode terminals
-            "B", "C", "E",       # BJT: Base, Collector, Emitter
-            "G", "D", "S",       # MOSFET: Gate, Drain, Source
+            "B", "C", "E",       # Base, Collector, Emitter
+            "G", "D", "S",       #  Gate, Drain, Source
             "A", "K",            # Diode: Anode, Cathode
             # Op-amp / comparator
             "V+", "V-", "OUT",
@@ -34,7 +34,7 @@ class SchematicTextClassifier:
         }
         
         self.regex_reference = re.compile(
-            r"^(LED|VR|RV|CR|DS|SW|TP|FB|TR|IC|FU|[RCLQUDFJSXYTMKPF])\d{1,4}[A-Z]?$",
+            r"^(LED|VR|RV|CR|DS|SW|TP|FB|TR|IC|FU|[RCLQUDFJSXYTMKPF])\d{0,4}[A-Z]?$",
             re.IGNORECASE
         )
         self.regex_value = re.compile(
