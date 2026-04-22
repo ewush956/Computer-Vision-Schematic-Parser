@@ -73,9 +73,7 @@ class SchematicTextClassifier:
         # text = re.sub(r"^[^a-zA-Z0-9]+", "", text)      # strip leading noise
         text = re.sub(r"[{}()\[\]]", r"1", text)         # { } likely misread as 1
         text = re.sub(r"^[1lI](\d{1,3}[A-Za-z]?)$", r"T\1", text) 
-        print(f"NORMALISED: '{text}'")  # add this temporarily
 
- 
         return text
  
 
