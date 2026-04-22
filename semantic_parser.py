@@ -34,7 +34,7 @@ class SchematicTextClassifier:
         }
         
         self.regex_reference = re.compile(
-            r"^(LED|VR|RV|CR|DS|SW|TP|FB|TR|IC|FU|[RCLQUDFJSXYTMKPF])\d{1,4}[A-Z]?$",
+            r"^(LED|VR|RV|CR|DS|SW|TP|FB|TR|IC|FU|[RCLQUDFJSXYTMKPF])\d{0,4}[A-Z]?$",
             re.IGNORECASE
         )
         self.regex_value = re.compile(
@@ -73,7 +73,7 @@ class SchematicTextClassifier:
         # text = re.sub(r"^[^a-zA-Z0-9]+", "", text)      # strip leading noise
         text = re.sub(r"[{}()\[\]]", r"1", text)         # { } likely misread as 1
         text = re.sub(r"^[1lI](\d{1,3}[A-Za-z]?)$", r"T\1", text) 
-
+        print(f"NORMALISED: '{text}'")  # add this temporarily
 
  
         return text

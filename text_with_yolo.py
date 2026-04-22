@@ -8,14 +8,11 @@ from PIL import Image
 import huggingface_hub.utils._validators as hf_validators
 import os
 
+# This code block below may cause an issue for mac or loonus userz (#works on MY machine)
+
 hf_validators.validate_repo_id = lambda repo_id: None
-
 script_dir = os.path.dirname(os.path.abspath(__file__))
-# MODEL_DIR = os.path.join(script_dir, "trocrSchematicFinal")
 MODEL_DIR = os.path.join(script_dir, "trocrSchematicFinal").replace("\\", "/")
-print("MODEL_DIR:", MODEL_DIR)
-print("Files:", os.listdir(MODEL_DIR))
-
 processor = TrOCRProcessor.from_pretrained(MODEL_DIR, local_files_only=True)
 trocr_model = VisionEncoderDecoderModel.from_pretrained(MODEL_DIR, local_files_only=True)
 trocr_model.eval()
@@ -23,7 +20,6 @@ trocr_model.eval()
 
 
 def run_ocr(crop_bgr) -> str:
-    """Run TrOCR on a BGR crop and return the predicted string."""
     rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
     pil_img = Image.fromarray(rgb).convert("RGB")
     pixel_values = processor(pil_img, return_tensors="pt").pixel_values
@@ -88,10 +84,10 @@ def process_schematic_with_yolo(image_path, model_path):
 
 
     output_path = './images_and_xml/yolo_raw_output.jpg'
-    if not Path(output_path).exists():
-        results[0].save(output_path)
+    #if not Path(output_path).exists():
+    results[0].save(output_path)
 
-IMAGE_FILE = 'images_and_xml/C-13_D1_P4.jpg'
+IMAGE_FILE = 'images_and_xml/C157_D1_P1.jpg'
 MODEL_FILE = './weights/best.pt'
 
 process_schematic_with_yolo(IMAGE_FILE, MODEL_FILE)
