@@ -5,33 +5,25 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from detectors.wire_detect import detect_wires
-from detectors.yolo_detection import detect_and_export_to_xml
+from model_inference.text_ocr import process_schematic_with_yolo
+from model_inference.wire_detect import detect_wires
+from model_inference.yolo_detection import detect_components
+# from model_inference.text_ocr import resolve_text_annotations
+from schematics.schematic import Schematic, SchematicParser
 from schematics.schematic_reconstructor import SchematicReconstructor, visualize_schematic
+# from schematics.schematic_reconstructor import SchematicReconstructor, visualize_schematic
 
-WIRE_MODEL = "models/unet_best.pth"
-YOLO_MODEL = "models/yolo.pt"
-
-
-def draw_component_boxes(
-    image_bgr: np.ndarray, component_xml: ET.ElementTree
-) -> np.ndarray:
+WIRE_MODEL_PATH = "models/unet_best.pth"
+YOLO_MODEL_PATH = "models/yolo.pt"
+OCR_MODEL_DIR = "./models/trocrSchematicFinal"
+def draw_component_boxes(image_bgr: np.ndarray, schematic: Schematic) -> np.ndarray:
     output = image_bgr.copy()
-    root = component_xml.getroot()
 
-    for component in root.findall("component"):
-        if component.get("class", "component") == "text":
-            continue
-        box = component.find("bounding_box")
-
-        x0 = int(box.get("xmin"))
-        y0 = int(box.get("ymin"))
-        x1 = int(box.get("xmax"))
-        y1 = int(box.get("ymax"))
-
-        cv2.rectangle(output, (x0, y0), (x1, y1), (0, 180, 255), 2)
-
+    for comp in schematic.components:
+        cv2.rectangle(output, (comp.xmin, comp.ymin), (comp.xmax, comp.ymax), (0, 180, 255), 2)
     return output
+
+
 
 
 def draw_polylines(
@@ -47,7 +39,7 @@ def draw_polylines(
     for polyline in polylines:
         if len(polyline) < 2:
             continue
-
+       
         points = np.array(polyline, dtype=np.int32).reshape(-1, 1, 2)
         line_color = (
             tuple(int(v) for v in rng.integers(40, 256, size=3))
@@ -69,7 +61,7 @@ def draw_polylines(
 def export_processing_steps(
     output_dir: Path,
     image_path: Path,
-    component_xml: ET.ElementTree,
+    schematic: Schematic,
     cleaned: np.ndarray,
     erased: np.ndarray,
     skeleton: np.ndarray,
@@ -83,10 +75,10 @@ def export_processing_steps(
 
     blank_canvas = np.full_like(image_bgr, 255)
 
-    yolo_overlay = draw_component_boxes(image_bgr, component_xml)
+    yolo_overlay = draw_component_boxes(image_bgr, schematic)
     polyline_overlay = draw_polylines(image_bgr, polylines, random_colors=True)
 
-    final_canvas = draw_component_boxes(blank_canvas, component_xml)
+    final_canvas = draw_component_boxes(blank_canvas, schematic)
     final_canvas = draw_polylines(
         final_canvas,
         polylines,
@@ -104,6 +96,7 @@ def export_processing_steps(
     cv2.imwrite(str(output_dir / "07_final_canvas.png"), final_canvas)
 
 
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description="Process hand-drawn circuit schematics."
@@ -115,19 +108,19 @@ def main(argv: list[str] | None = None) -> None:
 
     img_path = args.image
 
-    component_xml = detect_and_export_to_xml(
-        model_path=YOLO_MODEL,
-        image_path=str(img_path),
-        output_xml_path=f"output/{img_path.stem}.xml",
-    )
+    # Runs the yolo model and gives the component bounding boxes
+    yolo_result = detect_components(YOLO_MODEL_PATH,img_path, save_annotated=True, save_directory= "./processing_steps")
+    schematic = SchematicParser.from_yolo_to_schematic(yolo_result)
+    schematic = process_schematic_with_yolo(schematic, OCR_MODEL_DIR)
+
 
     cleaned, erased, skeleton, polyLines = detect_wires(
-        img_path, component_xml.getroot(), WIRE_MODEL
-    )
+         img_path,schematic, WIRE_MODEL_PATH
+     )
     export_processing_steps(
-        output_dir=Path("./output"),
+        output_dir=Path("./processing_steps"),
         image_path=img_path,
-        component_xml=component_xml,
+        schematic=schematic,
         cleaned=cleaned,
         erased=erased,
         skeleton=skeleton,
@@ -135,8 +128,11 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     schematic_recon = SchematicReconstructor()
-    schematic = schematic_recon.reconstruct(component_xml, polyLines, str(img_path))
-    visualize_schematic(schematic)
+    schematic = schematic_recon.connect_components(schematic=schematic, polyLines=polyLines)
+    visualize_schematic(schematic, "processing_steps/schematic_graph.png")
 
+    SchematicParser.save_to_xml(schematic,"./processing_steps/out.xml")
+
+    
 if __name__ == "__main__":
     main()

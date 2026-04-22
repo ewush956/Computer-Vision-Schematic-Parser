@@ -1,5 +1,4 @@
 from pathlib import Path
-import xml.etree.ElementTree as ET
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import cv2
@@ -8,6 +7,7 @@ import torch
 from skimage.morphology import skeletonize
 import segmentation_models_pytorch as smp
 
+from schematics.schematic import Schematic
 from swig import trace_skeleton
 
 DEVICE = (
@@ -67,28 +67,28 @@ def remove_small_blobs(mask: np.ndarray, min_area: int = 20) -> np.ndarray:
 
 def erase_components(
     mask: np.ndarray,
-    annotations: ET.Element,
+    schematic: Schematic,
     padding: int = 2,
 ) -> np.ndarray:
     """
-    Zero out bounding-box regions so component pixels. Must be done prior to removing small blobs and after running inference on the
+    Zero out bounding-box regions on component pixels. Must be done prior to removing small blobs and after running inference on the
     segmentation model
 
     Args:
-        mask:        Binary wire mask to modify.
-        annotations: Root XML element containing <bounding_box>.
-        padding:     Extra pixels to expand each box on all sides.
+        mask:      Binary wire mask to modify.
+        schematic: Schematic whose components define the regions to erase.
+        padding:   Extra pixels to expand each box on all sides.
 
     Returns:
         out (np.ndarray): Copy of mask with all component bounding-box regions set to 0.
     """
     out = mask.copy()
     height, width = mask.shape[:2]
-    for box in annotations.iter("bounding_box"):
-        x0 = max(0, int(box.get("xmin")) - padding)
-        y0 = max(0, int(box.get("ymin")) - padding)
-        x1 = min(width, int(box.get("xmax")) + padding)
-        y1 = min(height, int(box.get("ymax")) + padding)
+    for comp in schematic.components:
+        x0 = max(0, comp.xmin - padding)
+        y0 = max(0, comp.ymin - padding)
+        x1 = min(width, comp.xmax  + padding)
+        y1 = min(height, comp.ymax + padding)
         out[y0:y1, x0:x1] = 0
 
     return out
@@ -109,7 +109,7 @@ def sliding_window_inference(
     averages overlapping predictions back into a full-resolution binary mask.
 
     Args:
-        img (list[uint8]):    RGB image as a uint8 numpy array.
+        img (np.ndarray):     RGB image as a uint8 numpy array.
         model(torch.nn):      Segmentation model in eval mode.
         patch (int):      Patch size in pixels (both height and width).
         stride (int):     Step size between patches.
@@ -143,6 +143,7 @@ def sliding_window_inference(
     with torch.no_grad():
         for i in range(0, len(tensors), batch_size):
             batch = tensors[i : i + batch_size].to(DEVICE)
+            
             with torch.autocast(device_type=DEVICE):
                 preds_all.append(torch.sigmoid(model(batch)).squeeze(1).float().cpu())
     preds_all = torch.cat(preds_all).numpy()  # (N, H, W)
@@ -158,22 +159,21 @@ def sliding_window_inference(
 
 def detect_wires(
     image_path: str | Path,
-    annotations: ET.Element,
-    model_weights_path: str | Path,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, list]:
+    schematic : Schematic,
+    model_weights_path: str | Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[list[tuple[int, int]]]]:
     """
     Run wire segmentation on an image and return the cleaned binary wire mask.
 
     Args:
         image_path (str | Path):          Path to the input schematic image.
-        annotations (Et.Element):         Root XML element containing component bounding boxes.
+        schematic (Schematic):            Schematic containing component bounding boxes to erase.
         model_weights_path (str | Path):  Path to the segmentation model checkpoint.
 
     Returns:
         cleaned (np.ndarray):   Binary wire mask after blob removal.
         erased (np.ndarray):    Binary wire mask after component regions are zeroed out.
         skeleton (np.ndarray):  Bool skeleton array from skeletonize.
-        polys list[list[tuple]]:     List of polylines, each a list of points tracing a wire.
+        list[list[tuple[int, int]]]:     List of polylines, each a list of points tracing a wire.
     """
     model = load_model(model_weights_path)
 
@@ -189,7 +189,7 @@ def detect_wires(
     mask = sliding_window_inference(img_rgb, model)
 
     # Removing bounding boxes
-    erased = erase_components(mask, annotations)
+    erased = erase_components(mask, schematic)
 
     # Removing small patches
     cleaned = remove_small_blobs(erased, min_area=20)
