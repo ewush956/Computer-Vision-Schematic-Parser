@@ -22,6 +22,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from schematics.schematic import Schematic
+from schematics import routing
 import numpy as np
 import cv2
 
@@ -36,8 +37,6 @@ class SchematicReconstructor:
         self.confidence_threshold = confidence_threshold
         self.text_link_distance = text_link_distance
         self.connection_distance = connection_distance
-
-
 
     # ------------------------------------------------------------------
     # Filtering
@@ -56,14 +55,12 @@ class SchematicReconstructor:
         threshold : defaults to self.confidence_threshold if not provided
         """
         threshold = threshold if threshold is not None else self.confidence_threshold
-        kept = [c for c in schematic.components if c.confidence >= threshold]
+        kept = [c for c in schematic.components if c.yolo_conf >= threshold]
         return Schematic(
-            id=schematic.id,
-            image_name=schematic.image_name,
             width=schematic.width,
             height=schematic.height,
+            image_path=schematic.image_path,
             components=kept,
-            labels=list(schematic.labels),
             lines=list(schematic.lines),
         )
 
@@ -90,12 +87,10 @@ class SchematicReconstructor:
         else:
             kept = [c for c in schematic.components if c.class_name in names]
         return Schematic(
-            id=schematic.id,
-            image_name=schematic.image_name,
             width=schematic.width,
             height=schematic.height,
+            image_path=schematic.image_path,
             components=kept,
-            labels=list(schematic.labels),
             lines=list(schematic.lines),
         )
 
@@ -129,7 +124,7 @@ class SchematicReconstructor:
         if tolerance <= 0 or not schematic.components:
             return schematic
 
-        boxes = [c.bounding_box for c in schematic.components]
+        comps = schematic.components
 
         def spans_overlap(a0: int, a1: int, b0: int, b1: int) -> bool:
             return a1 > b0 and b1 > a0
@@ -163,55 +158,35 @@ class SchematicReconstructor:
                 i = j
             return result
 
-        centers_x = [(b.xmin + b.xmax) / 2.0 for b in boxes]
-        centers_y = [(b.ymin + b.ymax) / 2.0 for b in boxes]
-        x_spans = [(b.xmin, b.xmax) for b in boxes]
-        y_spans = [(b.ymin, b.ymax) for b in boxes]
+        centers_x = [(c.xmin + c.xmax) / 2.0 for c in comps]
+        centers_y = [(c.ymin + c.ymax) / 2.0 for c in comps]
+        x_spans = [(c.xmin, c.xmax) for c in comps]
+        y_spans = [(c.ymin, c.ymax) for c in comps]
 
         # When clustering x-centers, forbid merges that already overlap in y
         # (same row → collapsing x would stack them). And vice versa.
         new_x = cluster_means_guarded(centers_x, y_spans, tolerance)
         new_y = cluster_means_guarded(centers_y, x_spans, tolerance)
 
-        new_components = []
-        for c, nx, ny in zip(schematic.components, new_x, new_y):
-            box = c.bounding_box
+        # Mutate in place: the Schematic dataclass doesn't expose a way to
+        # rebuild with preserved IDs without poking at internal state, and
+        # Component is a plain dataclass so attribute assignment is fine.
+        for c, nx, ny in zip(comps, new_x, new_y):
             # Integer cluster centers, matched against the int center the
-            # snap routine will compute: (ymin+ymax)//2. Using the same
-            # formula here guarantees every cluster member ends with the
-            # exact same integer center — no 1-px jitter between aligned
-            # wires.
+            # snap routine computes: (xmin+xmax)//2. Using the same formula
+            # here guarantees every cluster member ends with the exact same
+            # integer center — no 1-px jitter between aligned wires.
             target_cx = int(round(nx))
             target_cy = int(round(ny))
-            old_cx = (box.xmin + box.xmax) // 2
-            old_cy = (box.ymin + box.ymax) // 2
+            old_cx = (c.xmin + c.xmax) // 2
+            old_cy = (c.ymin + c.ymax) // 2
             dx = target_cx - old_cx
             dy = target_cy - old_cy
-            new_box = BoundingBox(
-                xmin=box.xmin + dx,
-                ymin=box.ymin + dy,
-                xmax=box.xmax + dx,
-                ymax=box.ymax + dy,
-            )
-            new_components.append(
-                Component(
-                    id=c.id,
-                    class_name=c.class_name,
-                    confidence=c.confidence,
-                    bounding_box=new_box,
-                    label=c.label,
-                )
-            )
-        return Schematic(
-            id=schematic.id,
-            image_name=schematic.image_name,
-            width=schematic.width,
-            height=schematic.height,
-            components=new_components,
-            labels=list(schematic.labels),
-            lines=list(schematic.lines),
-        )
-
+            c.xmin += dx
+            c.xmax += dx
+            c.ymin += dy
+            c.ymax += dy
+        return schematic
 
     # AMTOJ: Spatially associate each "text" detection with its nearest non-text component
     # Implement Euclidean (pacman) distance
@@ -233,24 +208,8 @@ class SchematicReconstructor:
         schematic       : Schematic still containing "text" components
         max_distance_px : maximum center-to-center distance to form a link
         """
-        text_components = [
-            c for c in schematic.components if c.class_name.lower() == "text"
-        ]
-        non_text = [c for c in schematic.components if c.class_name.lower() != "text"]
-
-        # Copy non-text components so we don't mutate the input Schematic.
-        new_components: dict[int, Component] = {
-            c.id: Component(
-                id=c.id,
-                class_name=c.class_name,
-                confidence=c.confidence,
-                bounding_box=c.bounding_box,
-                label=c.label,
-            )
-            for c in non_text
-        }
-
-        new_labels: list[Label] = list(schematic.labels)
+        text_components = [c for c in schematic.components if c.is_text]
+        non_text = [c for c in schematic.components if not c.is_text]
 
         for text_comp in text_components:
             tx, ty = self.get_center(text_comp)
@@ -267,47 +226,24 @@ class SchematicReconstructor:
             if best_target is None or best_dist > max_distance_px:
                 continue
 
-            label = Label(
-                id=text_comp.id,
-                raw_text=text_comp.class_name,
-                confidence=text_comp.confidence,
-                bounding_box=text_comp.bounding_box,
-                semantic_type=None,
-            )
-            new_labels.append(label)
-            new_components[best_target.id].label = label
+            # Transfer OCR text onto the nearest non-text component.
+            if text_comp.text is not None:
+                best_target.text = text_comp.text
+                best_target.text_type = text_comp.text_type
 
-        # Preserve original component order (keep "text" components too).
-        rebuilt = []
-        for c in schematic.components:
-            if c.id in new_components:
-                rebuilt.append(new_components[c.id])
-            else:
-                rebuilt.append(c)
-
-        return Schematic(
-            id=schematic.id,
-            image_name=schematic.image_name,
-            width=schematic.width,
-            height=schematic.height,
-            components=rebuilt,
-            labels=new_labels,
-            lines=list(schematic.lines),
-        )
+        return schematic
 
     # ------------------------------------------------------------------
     # Geometry helpers
     # ------------------------------------------------------------------
 
-    def get_center(self, component: Component) -> tuple[float, float]:
+    def get_center(self, component) -> tuple[float, float]:
         """Return (cx, cy) center of the component's bounding box."""
-        box = component.bounding_box
-        return (box.center_x, box.center_y)
+        return (component.center_x, component.center_y)
 
-    def get_bounds(self, component: Component) -> tuple[int, int, int, int]:
+    def get_bounds(self, component) -> tuple[int, int, int, int]:
         """Return (xmin, ymin, xmax, ymax) for the component's bounding box."""
-        box = component.bounding_box
-        return (box.xmin, box.ymin, box.xmax, box.ymax)
+        return (component.xmin, component.ymin, component.xmax, component.ymax)
 
     # DEPANSHU: Determine which components are electrically connected based on proximity
     # Feel free to do this however you want, this is just a thought on how you could go about it.
@@ -348,8 +284,9 @@ class SchematicReconstructor:
                 from_id = None
                 to_id = None
 
-            schematic_with_lines.add_polylines(polyline, status, start_component=from_id, end_component=to_id)
-           
+            schematic_with_lines.add_polylines(
+                polyline, status, start_component=from_id, end_component=to_id
+            )
 
         return schematic_with_lines
 
@@ -361,13 +298,22 @@ class SchematicReconstructor:
 
         return (dx * dx + dy * dy) ** 0.5
 
-    def nearest_component_box(self, point, components, strict_margin=30, exclude_component_id: int | None =None):
+    def nearest_component_box(
+        self,
+        point,
+        components,
+        strict_margin=30,
+        exclude_component_id: int | None = None,
+    ):
         best_component = None
         best_distance = float("inf")
 
         for component in components:
 
-            if component.class_name.lower() == "text" or component.id == exclude_component_id:
+            if (
+                component.class_name.lower() == "text"
+                or component.id == exclude_component_id
+            ):
                 continue
 
             distance = self.point_to_box_distance(point, component)
@@ -498,17 +444,21 @@ class SchematicReconstructor:
 
     # EVAN: Draw arrows between connected components on the canvas
     def draw_lines(self, canvas, schematic: Schematic) -> None:
-        """
-        For every Line in schematic.lines, draw an arrow from the center of
-        the from_id component to the center of the to_id component.
-        Uses get_center() to retrieve coordinates.
+        """Render every Line as an orthogonal A*-routed polyline.
 
-        Parameters
-        ----------
-        canvas    : canvas already passed through draw_components()
-        schematic : Schematic whose lines list will be rendered
+        Routing happens on an 8-px grid (see :mod:`schematics.routing`):
+
+        1. Choose the port pair on the two components that minimises
+           Manhattan distance.
+        2. A* search avoids every other component's bounding box.
+        3. Collinear waypoints are collapsed so the final polyline is only
+           endpoints and bends.
+
+        Dangling wires (only one matched end) are routed from the matched
+        component's nearest port to the traced endpoint.
         """
         components_by_id = {c.id: c for c in schematic.components}
+        obstacles = schematic.components
 
         for line in schematic.lines:
             if line.status not in ("connected", "dangling"):
@@ -516,30 +466,12 @@ class SchematicReconstructor:
             if len(line.polyline) < 2:
                 continue
 
-            start = line.polyline[0]
-            end = line.polyline[-1]
+            from_comp = components_by_id.get(line.start_component_id)
+            to_comp = components_by_id.get(line.end_component_id)
 
-            # Snap each endpoint onto the matched component's bounding box edge
-            # so the wire visibly terminates at the component. Unmatched ends of
-            # dangling wires are left at the traced endpoint.
-            from_comp = components_by_id.get(line.from_id)
-            to_comp = components_by_id.get(line.to_id)
-            if from_comp is not None:
-                start = self._snap_to_box_edge(start, from_comp.bounding_box)
-            if to_comp is not None:
-                end = self._snap_to_box_edge(end, to_comp.bounding_box)
-
-            # Manhattan Z-route between the (snapped) endpoints.
-            x0, y0 = start
-            x1, y1 = end
-            dx = abs(x1 - x0)
-            dy = abs(y1 - y0)
-            if dx >= dy:
-                mid_x = self._snap((x0 + x1) / 2, 8)
-                route = [(x0, y0), (mid_x, y0), (mid_x, y1), (x1, y1)]
-            else:
-                mid_y = self._snap((y0 + y1) / 2, 8)
-                route = [(x0, y0), (x0, mid_y), (x1, mid_y), (x1, y1)]
+            route = self._route_line(line, from_comp, to_comp, obstacles)
+            if route is None or len(route) < 2:
+                continue
 
             points = np.array(route, dtype=np.int32).reshape(-1, 1, 2)
             cv2.polylines(
@@ -547,9 +479,50 @@ class SchematicReconstructor:
                 [points],
                 isClosed=False,
                 color=(0, 0, 0),
-                thickness=1,
-                lineType=cv2.LINE_8,
+                thickness=2,
+                lineType=cv2.LINE_AA,
             )
+
+    def _route_line(
+        self, line, from_comp, to_comp, obstacles
+    ) -> list[tuple[int, int]] | None:
+        """Return an orthogonal grid route for ``line``, or None if unroutable."""
+        start_dir = None
+        end_dir = None
+        exclude_ids: set[int] = set()
+
+        if from_comp is not None and to_comp is not None:
+            (start, from_side), (end, to_side) = routing.select_port_pair(
+                from_comp, to_comp
+            )
+            start_dir = routing.port_outward(from_side)
+            # end_dir is the step *into* the end port, i.e. opposite the
+            # port's outward direction.
+            ox, oy = routing.port_outward(to_side)
+            end_dir = (-ox, -oy)
+            exclude_ids = {from_comp.id, to_comp.id}
+        elif from_comp is not None:
+            start, from_side = routing.nearest_port(from_comp, line.polyline[-1])
+            end = routing.snap_point(line.polyline[-1])
+            start_dir = routing.port_outward(from_side)
+            exclude_ids = {from_comp.id}
+        elif to_comp is not None:
+            start = routing.snap_point(line.polyline[0])
+            end, to_side = routing.nearest_port(to_comp, line.polyline[0])
+            ox, oy = routing.port_outward(to_side)
+            end_dir = (-ox, -oy)
+            exclude_ids = {to_comp.id}
+        else:
+            return None
+
+        return routing.route_line(
+            start,
+            end,
+            obstacles,
+            exclude_ids=exclude_ids,
+            start_dir=start_dir,
+            end_dir=end_dir,
+        )
 
     # AMTOJ: Resolve label text for linked components
     # EVAN: Render the label overlay onto the canvas
@@ -583,18 +556,15 @@ class SchematicReconstructor:
             if component.class_name.lower() in ("text", "junction"):
                 continue
 
-            # Prefer a linked label, but skip the placeholder "text" raw_text
+            # Prefer the linked OCR text, but skip the placeholder "text"
             # that leaks through when no OCR is present.
-            if (
-                component.label is not None
-                and component.label.raw_text.lower() != "text"
-            ):
-                text = component.label.raw_text
+            if component.text is not None and component.text.lower() != "text":
+                text = component.text
             else:
                 text = component.class_name
 
             if show_confidence:
-                text = f"{text} ({component.confidence:.2f})"
+                text = f"{text} ({component.yolo_conf:.2f})"
 
             xmin, ymin, xmax, ymax = self.get_bounds(component)
             (tw, th), baseline = cv2.getTextSize(text, font, font_scale, thickness)
@@ -697,9 +667,8 @@ class SchematicReconstructor:
             comp = components_by_id.get(comp_id)
             if comp is None:
                 return
-            box = comp.bounding_box
-            cx = (box.xmin + box.xmax) / 2.0
-            cy = (box.ymin + box.ymax) / 2.0
+            cx = comp.center_x
+            cy = comp.center_y
             h, v = votes.get(comp_id, (0, 0))
             if abs(point[0] - cx) >= abs(point[1] - cy):
                 h += 1
@@ -710,106 +679,15 @@ class SchematicReconstructor:
         for line in schematic.lines:
             if not line.polyline:
                 continue
-            if line.from_id is not None:
-                cast_vote(line.from_id, line.polyline[0])
-            if line.to_id is not None:
-                cast_vote(line.to_id, line.polyline[-1])
+            if line.start_component_id is not None:
+                cast_vote(line.start_component_id, line.polyline[0])
+            if line.end_component_id is not None:
+                cast_vote(line.end_component_id, line.polyline[-1])
 
         result: dict[int, str] = {}
         for comp_id, (h, v) in votes.items():
             result[comp_id] = "horizontal" if h >= v else "vertical"
         return result
-
-    def _snap(self, v: float, grid: int) -> int:
-        return int(round(v / grid) * grid)
-
-    def snap_components_to_grid(self, schematic: Schematic, grid: int = 8) -> Schematic:
-        new_components = []
-
-        for c in schematic.components:
-            b = c.bounding_box
-
-            cx = (b.xmin + b.xmax) // 2
-            cy = (b.ymin + b.ymax) // 2
-
-            snapped_cx = self._snap(cx, grid)
-            snapped_cy = self._snap(cy, grid)
-
-            dx = snapped_cx - cx
-            dy = snapped_cy - cy
-
-            new_box = BoundingBox(
-                xmin=b.xmin + dx,
-                ymin=b.ymin + dy,
-                xmax=b.xmax + dx,
-                ymax=b.ymax + dy,
-            )
-
-            new_components.append(
-                Component(
-                    id=c.id,
-                    class_name=c.class_name,
-                    confidence=c.confidence,
-                    bounding_box=new_box,
-                    label=c.label,
-                )
-            )
-
-        return Schematic(
-            id=schematic.id,
-            image_name=schematic.image_name,
-            width=schematic.width,
-            height=schematic.height,
-            components=new_components,
-            labels=list(schematic.labels),
-            lines=list(schematic.lines),
-        )
-
-    def _snap_to_box_edge(
-        self, point: tuple[int, int], box: BoundingBox, grid: int = 8
-    ) -> tuple[int, int]:
-        """Snap ``point`` to the midpoint of whichever box edge it approaches.
-
-        Pick the edge whose overshoot from ``point`` is largest (left/right/
-        top/bottom), then return that edge's midpoint. Unlike projecting the
-        point onto the edge, this collapses any per-wire jitter in the free
-        coordinate: two components that share a y-coordinate both receive
-        wires at their exact center_y, so Manhattan routing produces a single
-        straight segment instead of a small step.
-
-        Tradeoff: two wires entering the same side of the same component land
-        on the same pixel. In practice multi-pin components (transistors, op-
-        amps, ICs) have pins on different sides, so this rarely causes visual
-        overlap.
-        """
-        x, y = point
-        cx_box = (box.xmin + box.xmax) // 2
-        cy_box = (box.ymin + box.ymax) // 2
-
-        overs = (
-            (box.xmin - x, "left"),
-            (x - box.xmax, "right"),
-            (box.ymin - y, "top"),
-            (y - box.ymax, "bottom"),
-        )
-        max_over, side = max(overs, key=lambda o: o[0])
-
-        if max_over <= 0:
-            dists = (
-                (x - box.xmin, "left"),
-                (box.xmax - x, "right"),
-                (y - box.ymin, "top"),
-                (box.ymax - y, "bottom"),
-            )
-            _, side = min(dists, key=lambda d: d[0])
-
-        if side == "left":
-            return (self._snap(box.xmin, grid), self._snap(cy_box, grid))
-        if side == "right":
-            return (self._snap(box.xmax, grid), self._snap(cy_box, grid))
-        if side == "top":
-            return (self._snap(cx_box, grid), self._snap(box.ymin, grid))
-        return (self._snap(cx_box, grid), self._snap(box.ymax, grid))
 
     def _class_color(self, class_name: str) -> tuple[int, int, int]:
         """Deterministic BGR color keyed off the class name."""
@@ -828,11 +706,10 @@ def visualize_schematic(schematic, output_path="output/schematic_graph.png"):
     components_by_id = {component.id: component for component in schematic.components}
     color = (0, 180, 0)
 
-
     for line in schematic.lines:
         if line.status != "connected":
             continue
-        
+
         if len(line.polyline) >= 2:
             points = np.array(line.polyline, dtype=np.int32).reshape(-1, 1, 2)
             cv2.polylines(
@@ -844,7 +721,6 @@ def visualize_schematic(schematic, output_path="output/schematic_graph.png"):
                 lineType=cv2.LINE_AA,
             )
             continue
-
 
         from_component = components_by_id[line.start_component_id]
         to_component = components_by_id[line.end_component_id]
@@ -883,15 +759,70 @@ def visualize_schematic(schematic, output_path="output/schematic_graph.png"):
     cv2.imwrite(str(output_path), canvas)
 
 
+# ---------------------------------------------------------------------------
+# High-level pipeline helpers
+# ---------------------------------------------------------------------------
+
+WIRE_MODEL_PATH = "models/unet_best.pth"
+YOLO_MODEL_PATH = "models/yolo.pt"
+
+
+def run_inference(
+    image_path: str | Path,
+    reconstructor: "SchematicReconstructor | None" = None,
+    align: int | None = None,
+    yolo_model_path: str = YOLO_MODEL_PATH,
+    wire_model_path: str = WIRE_MODEL_PATH,
+) -> tuple[Schematic, int]:
+    """Run YOLO + wire detection + filtering + alignment on ``image_path``.
+
+    Returns the finalised ``Schematic`` plus the raw polyline count (useful
+    for logging). The image's detected component XML is also written to
+    ``output/<stem>.xml`` as a side-effect, matching the existing pipeline.
+    """
+    from model_inference.wire_detect import detect_wires
+    from model_inference.yolo_detection import detect_components
+    from schematics.schematic import SchematicParser
+
+    reconstructor = reconstructor or SchematicReconstructor()
+    image_path = Path(image_path)
+
+    yolo_result = detect_components(
+        model_path=yolo_model_path,
+        image_path=str(image_path),
+    )
+    schematic = SchematicParser.from_yolo_to_schematic(yolo_result)
+    SchematicParser.save_to_xml(schematic, f"output/{image_path.stem}.xml")
+
+    _cleaned, _erased, _skeleton, polylines = detect_wires(
+        image_path, schematic, wire_model_path
+    )
+
+    schematic = reconstructor.filter_by_confidence(schematic)
+    schematic = reconstructor.link_text_to_components(schematic)
+    schematic = reconstructor.connect_components(schematic, polylines)
+    schematic = reconstructor.filter_by_class(schematic, ["text"], exclude=True)
+    schematic = reconstructor.align_components(schematic, tolerance=align)
+    return schematic, len(polylines)
+
+
+def render_schematic(
+    schematic: Schematic,
+    labels: bool = True,
+    reconstructor: "SchematicReconstructor | None" = None,
+) -> np.ndarray:
+    """Render ``schematic`` to a fresh BGR canvas and return it."""
+    reconstructor = reconstructor or SchematicReconstructor()
+    canvas = reconstructor.render_canvas(schematic)
+    reconstructor.draw_components(canvas, schematic)
+    reconstructor.draw_lines(canvas, schematic)
+    if labels:
+        reconstructor.annotate_labels(canvas, schematic)
+    return canvas
+
+
 if __name__ == "__main__":
-    # Full reconstruction pipeline on tests/images/testcase1.png.
     import argparse
-
-    from detectors.wire_detect import detect_wires
-    from detectors.yolo_detection import detect_and_export_to_xml
-
-    WIRE_MODEL = "models/unet_best.pth"
-    YOLO_MODEL = "models/yolo.pt"
 
     arg_parser = argparse.ArgumentParser(description="Reconstruct a schematic image.")
     arg_parser.add_argument(
@@ -950,32 +881,18 @@ if __name__ == "__main__":
         else:
             output_path = Path(f"tests/outputs/{image_path.stem}{suffix}.png")
 
-        component_xml = detect_and_export_to_xml(
-            model_path=YOLO_MODEL,
-            image_path=str(image_path),
-            output_xml_path=f"output/{image_path.stem}.xml",
+        schematic, n_polys = run_inference(
+            image_path,
+            reconstructor=reconstructor,
+            align=args.align,
         )
-
-        _cleaned, _erased, _skeleton, polylines = detect_wires(
-            image_path, component_xml.getroot(), WIRE_MODEL
+        canvas = render_schematic(
+            schematic, labels=args.labels, reconstructor=reconstructor
         )
-
-        schematic = reconstructor.reconstruct(component_xml, polylines, str(image_path))
-        schematic = reconstructor.filter_by_confidence(schematic)
-        schematic = reconstructor.link_text_to_components(schematic)
-        # Keep junctions — they're rendered as connection dots; only drop text.
-        schematic = reconstructor.filter_by_class(schematic, ["text"], exclude=True)
-        schematic = reconstructor.align_components(schematic, tolerance=args.align)
-
-        canvas = reconstructor.render_canvas(schematic)
-        reconstructor.draw_components(canvas, schematic)
-        reconstructor.draw_lines(canvas, schematic)
-        if args.labels:
-            reconstructor.annotate_labels(canvas, schematic)
         reconstructor.export_image(canvas, output_path)
 
         print(
             f"Wrote {output_path}  (labels={'on' if args.labels else 'off'}, "
-            f"polylines={len(polylines)})"
+            f"polylines={n_polys})"
         )
         print(f"  Counts: {reconstructor.summarise(schematic)}")
