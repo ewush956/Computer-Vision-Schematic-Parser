@@ -154,6 +154,119 @@ class SchematicReconstructor:
         )
 
     # ------------------------------------------------------------------
+    # 3. Component alignment
+    # ------------------------------------------------------------------
+
+    def align_components(
+        self, schematic: Schematic, tolerance: int | None = None
+    ) -> Schematic:
+        """
+        Cluster component centers along each axis independently and snap
+        every member of a cluster to the cluster mean. Two components whose
+        centers differ by less than ``tolerance`` on one axis are forced to
+        share that axis — so Manhattan routing between them collapses to a
+        single straight segment instead of a small dog-leg.
+
+        Clustering is done by sorting the axis values and cutting a new
+        cluster whenever the gap between consecutive values exceeds
+        ``tolerance``.
+
+        Parameters
+        ----------
+        tolerance : maximum center-to-center gap (px) that still counts as
+                    "aligned". Defaults to 8 px, which keeps closely-spaced
+                    components from collapsing onto each other while still
+                    straightening wire rows/columns.
+        """
+        if tolerance is None:
+            tolerance = 8
+        if tolerance <= 0 or not schematic.components:
+            return schematic
+
+        boxes = [c.bounding_box for c in schematic.components]
+
+        def spans_overlap(a0: int, a1: int, b0: int, b1: int) -> bool:
+            return a1 > b0 and b1 > a0
+
+        def cluster_means_guarded(
+            values: list[float], other_spans: list[tuple[int, int]], tol: int
+        ) -> list[float]:
+            """Cluster by axis value, but never merge two components whose
+            bboxes already overlap on the OTHER axis — collapsing their
+            value here would stack them on top of each other.
+            """
+            order = sorted(range(len(values)), key=lambda i: values[i])
+            result = [0.0] * len(values)
+            i = 0
+            while i < len(order):
+                cluster = [order[i]]
+                j = i + 1
+                while j < len(order) and values[order[j]] - values[order[j - 1]] <= tol:
+                    cand = order[j]
+                    c0, c1 = other_spans[cand]
+                    if any(
+                        spans_overlap(c0, c1, other_spans[m][0], other_spans[m][1])
+                        for m in cluster
+                    ):
+                        break
+                    cluster.append(cand)
+                    j += 1
+                mean = sum(values[k] for k in cluster) / len(cluster)
+                for k in cluster:
+                    result[k] = mean
+                i = j
+            return result
+
+        centers_x = [(b.xmin + b.xmax) / 2.0 for b in boxes]
+        centers_y = [(b.ymin + b.ymax) / 2.0 for b in boxes]
+        x_spans = [(b.xmin, b.xmax) for b in boxes]
+        y_spans = [(b.ymin, b.ymax) for b in boxes]
+
+        # When clustering x-centers, forbid merges that already overlap in y
+        # (same row → collapsing x would stack them). And vice versa.
+        new_x = cluster_means_guarded(centers_x, y_spans, tolerance)
+        new_y = cluster_means_guarded(centers_y, x_spans, tolerance)
+
+        new_components = []
+        for c, nx, ny in zip(schematic.components, new_x, new_y):
+            box = c.bounding_box
+            # Integer cluster centers, matched against the int center the
+            # snap routine will compute: (ymin+ymax)//2. Using the same
+            # formula here guarantees every cluster member ends with the
+            # exact same integer center — no 1-px jitter between aligned
+            # wires.
+            target_cx = int(round(nx))
+            target_cy = int(round(ny))
+            old_cx = (box.xmin + box.xmax) // 2
+            old_cy = (box.ymin + box.ymax) // 2
+            dx = target_cx - old_cx
+            dy = target_cy - old_cy
+            new_box = BoundingBox(
+                xmin=box.xmin + dx,
+                ymin=box.ymin + dy,
+                xmax=box.xmax + dx,
+                ymax=box.ymax + dy,
+            )
+            new_components.append(
+                Component(
+                    id=c.id,
+                    class_name=c.class_name,
+                    confidence=c.confidence,
+                    bounding_box=new_box,
+                    label=c.label,
+                )
+            )
+        return Schematic(
+            id=schematic.id,
+            image_name=schematic.image_name,
+            width=schematic.width,
+            height=schematic.height,
+            components=new_components,
+            labels=list(schematic.labels),
+            lines=list(schematic.lines),
+        )
+
+    # ------------------------------------------------------------------
     # 4. Text & component linking
     # ------------------------------------------------------------------
 
@@ -177,7 +290,9 @@ class SchematicReconstructor:
         schematic       : Schematic still containing "text" components
         max_distance_px : maximum center-to-center distance to form a link
         """
-        text_components = [c for c in schematic.components if c.class_name.lower() == "text"]
+        text_components = [
+            c for c in schematic.components if c.class_name.lower() == "text"
+        ]
         non_text = [c for c in schematic.components if c.class_name.lower() != "text"]
 
         # Copy non-text components so we don't mutate the input Schematic.
@@ -483,10 +598,10 @@ class SchematicReconstructor:
             dx = abs(x1 - x0)
             dy = abs(y1 - y0)
             if dx >= dy:
-                mid_x = (x0 + x1) // 2
+                mid_x = self._snap((x0 + x1) / 2, 8)
                 route = [(x0, y0), (mid_x, y0), (mid_x, y1), (x1, y1)]
             else:
-                mid_y = (y0 + y1) // 2
+                mid_y = self._snap((y0 + y1) / 2, 8)
                 route = [(x0, y0), (x0, mid_y), (x1, mid_y), (x1, y1)]
 
             points = np.array(route, dtype=np.int32).reshape(-1, 1, 2)
@@ -533,7 +648,10 @@ class SchematicReconstructor:
 
             # Prefer a linked label, but skip the placeholder "text" raw_text
             # that leaks through when no OCR is present.
-            if component.label is not None and component.label.raw_text.lower() != "text":
+            if (
+                component.label is not None
+                and component.label.raw_text.lower() != "text"
+            ):
                 text = component.label.raw_text
             else:
                 text = component.class_name
@@ -665,30 +783,96 @@ class SchematicReconstructor:
             result[comp_id] = "horizontal" if h >= v else "vertical"
         return result
 
-    def _snap_to_box_edge(
-        self, point: tuple[int, int], box: BoundingBox
-    ) -> tuple[int, int]:
-        """Project ``point`` onto the closest point of the bounding-box perimeter.
+    def _snap(self, v: float, grid: int) -> int:
+        return int(round(v / grid) * grid)
 
-        For points outside the box this clamps both coordinates into range, which
-        lands on whichever side/corner of the box is nearest. For points inside
-        the box, push to the nearest edge so the wire appears to terminate at
-        the symbol outline rather than disappearing into it.
+    def snap_components_to_grid(self, schematic: Schematic, grid: int = 8) -> Schematic:
+        new_components = []
+
+        for c in schematic.components:
+            b = c.bounding_box
+
+            cx = (b.xmin + b.xmax) // 2
+            cy = (b.ymin + b.ymax) // 2
+
+            snapped_cx = self._snap(cx, grid)
+            snapped_cy = self._snap(cy, grid)
+
+            dx = snapped_cx - cx
+            dy = snapped_cy - cy
+
+            new_box = BoundingBox(
+                xmin=b.xmin + dx,
+                ymin=b.ymin + dy,
+                xmax=b.xmax + dx,
+                ymax=b.ymax + dy,
+            )
+
+            new_components.append(
+                Component(
+                    id=c.id,
+                    class_name=c.class_name,
+                    confidence=c.confidence,
+                    bounding_box=new_box,
+                    label=c.label,
+                )
+            )
+
+        return Schematic(
+            id=schematic.id,
+            image_name=schematic.image_name,
+            width=schematic.width,
+            height=schematic.height,
+            components=new_components,
+            labels=list(schematic.labels),
+            lines=list(schematic.lines),
+        )
+
+    def _snap_to_box_edge(
+        self, point: tuple[int, int], box: BoundingBox, grid: int = 8
+    ) -> tuple[int, int]:
+        """Snap ``point`` to the midpoint of whichever box edge it approaches.
+
+        Pick the edge whose overshoot from ``point`` is largest (left/right/
+        top/bottom), then return that edge's midpoint. Unlike projecting the
+        point onto the edge, this collapses any per-wire jitter in the free
+        coordinate: two components that share a y-coordinate both receive
+        wires at their exact center_y, so Manhattan routing produces a single
+        straight segment instead of a small step.
+
+        Tradeoff: two wires entering the same side of the same component land
+        on the same pixel. In practice multi-pin components (transistors, op-
+        amps, ICs) have pins on different sides, so this rarely causes visual
+        overlap.
         """
         x, y = point
-        cx = max(box.xmin, min(int(x), box.xmax))
-        cy = max(box.ymin, min(int(y), box.ymax))
-        inside = box.xmin < cx < box.xmax and box.ymin < cy < box.ymax
-        if inside:
-            edges = (
-                (cx - box.xmin, (box.xmin, cy)),
-                (box.xmax - cx, (box.xmax, cy)),
-                (cy - box.ymin, (cx, box.ymin)),
-                (box.ymax - cy, (cx, box.ymax)),
+        cx_box = (box.xmin + box.xmax) // 2
+        cy_box = (box.ymin + box.ymax) // 2
+
+        overs = (
+            (box.xmin - x, "left"),
+            (x - box.xmax, "right"),
+            (box.ymin - y, "top"),
+            (y - box.ymax, "bottom"),
+        )
+        max_over, side = max(overs, key=lambda o: o[0])
+
+        if max_over <= 0:
+            dists = (
+                (x - box.xmin, "left"),
+                (box.xmax - x, "right"),
+                (y - box.ymin, "top"),
+                (box.ymax - y, "bottom"),
             )
-            _, snapped = min(edges, key=lambda e: e[0])
-            return (int(snapped[0]), int(snapped[1]))
-        return (int(cx), int(cy))
+            _, side = min(dists, key=lambda d: d[0])
+
+        if side == "left":
+            return (self._snap(box.xmin, grid), self._snap(cy_box, grid))
+        if side == "right":
+            return (self._snap(box.xmax, grid), self._snap(cy_box, grid))
+        if side == "top":
+            return (self._snap(cx_box, grid), self._snap(box.ymin, grid))
+        return (self._snap(cx_box, grid), self._snap(box.ymax, grid))
 
     def _class_color(self, class_name: str) -> tuple[int, int, int]:
         """Deterministic BGR color keyed off the class name."""
@@ -811,6 +995,13 @@ if __name__ == "__main__":
         help="Skip drawing labels.",
     )
     arg_parser.set_defaults(labels=True)
+    arg_parser.add_argument(
+        "--align",
+        type=int,
+        default=None,
+        help="Alignment tolerance (px) for clustering nearby component centers "
+        "onto a shared axis. 0 disables alignment. Default: adaptive to image width.",
+    )
     args = arg_parser.parse_args()
 
     if args.image is not None:
@@ -849,6 +1040,7 @@ if __name__ == "__main__":
         schematic = reconstructor.link_text_to_components(schematic)
         # Keep junctions — they're rendered as connection dots; only drop text.
         schematic = reconstructor.filter_by_class(schematic, ["text"], exclude=True)
+        schematic = reconstructor.align_components(schematic, tolerance=args.align)
 
         canvas = reconstructor.render_canvas(schematic)
         reconstructor.draw_components(canvas, schematic)
