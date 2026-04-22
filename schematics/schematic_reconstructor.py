@@ -25,6 +25,30 @@ from schematics.schematic import Schematic
 from schematics import routing
 import numpy as np
 import cv2
+from PIL import Image, ImageDraw, ImageFont
+
+# Cached TTF font handle — Hershey stroke fonts used by cv2.putText are
+# ASCII-only, so Ω/μ/° etc. render as "?". Pillow + TrueType gives us full
+# Unicode coverage for the OCR'd labels.
+_UNICODE_FONT_CANDIDATES = (
+    "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+    "/Library/Fonts/Arial.ttf",
+    "/System/Library/Fonts/Helvetica.ttc",
+    "C:\\Windows\\Fonts\\arial.ttf",
+)
+
+
+def _unicode_font_path() -> str | None:
+    for candidate in _UNICODE_FONT_CANDIDATES:
+        if Path(candidate).exists():
+            return candidate
+    return None
+
+
+_UNICODE_FONT_PATH = _unicode_font_path()
 
 
 class SchematicReconstructor:
@@ -112,6 +136,10 @@ class SchematicReconstructor:
         cluster whenever the gap between consecutive values exceeds
         ``tolerance``.
 
+        Text components are excluded from clustering: their centers are
+        often off-grid relative to the real symbols, and shifting them would
+        move OCR'd labels away from where the writer placed them.
+
         Parameters
         ----------
         tolerance : maximum center-to-center gap (px) that still counts as
@@ -124,7 +152,9 @@ class SchematicReconstructor:
         if tolerance <= 0 or not schematic.components:
             return schematic
 
-        comps = schematic.components
+        comps = [c for c in schematic.components if not c.is_text]
+        if not comps:
+            return schematic
 
         def spans_overlap(a0: int, a1: int, b0: int, b1: int) -> bool:
             return a1 > b0 and b1 > a0
@@ -193,15 +223,16 @@ class SchematicReconstructor:
     def link_text_to_components(
         self,
         schematic: Schematic,
-        # 50 is just a guess, set this to whatever you think is reasonable
-        max_distance_px: float = 50.0,
+        max_distance_px: float = 150.0,
     ) -> Schematic:
         """
         For every component with class_name == "text", find the nearest
         non-text component by center distance. If within max_distance_px,
-        write that text value into the target component's linked_text field.
-
-        Returns a new Schematic; the original is not mutated.
+        copy the OCR string into that target component's ``text`` field so
+        the legend / banner label can display the value. The text component
+        itself is *kept* in the schematic — ``annotate_labels`` renders the
+        handwritten OCR at the original bbox in-place (matching the size and
+        position of the writer's hand-lettered label).
 
         Parameters
         ----------
@@ -212,6 +243,8 @@ class SchematicReconstructor:
         non_text = [c for c in schematic.components if not c.is_text]
 
         for text_comp in text_components:
+            if text_comp.text is None:
+                continue
             tx, ty = self.get_center(text_comp)
 
             best_target = None
@@ -224,13 +257,23 @@ class SchematicReconstructor:
                     best_target = target
 
             if best_target is None or best_dist > max_distance_px:
+                print(
+                    f"TEXT (unlinked): '{text_comp.text}' "
+                    f"nearest={best_target.class_name if best_target else None} "
+                    f"dist={best_dist:.1f}"
+                )
                 continue
 
-            # Transfer OCR text onto the nearest non-text component.
-            if text_comp.text is not None:
+            # Mirror OCR text onto the nearest non-text component so legend
+            # summaries can reference it; the text component keeps its own
+            # copy for in-place rendering.
+            if best_target.text is None:
                 best_target.text = text_comp.text
                 best_target.text_type = text_comp.text_type
-
+            print(
+                f"TEXT: '{text_comp.text}' -> {best_target.class_name} "
+                f"dist={best_dist:.1f}"
+            )
         return schematic
 
     # ------------------------------------------------------------------
@@ -458,7 +501,8 @@ class SchematicReconstructor:
         component's nearest port to the traced endpoint.
         """
         components_by_id = {c.id: c for c in schematic.components}
-        obstacles = schematic.components
+        # Text bboxes shouldn't deflect wires — they're just annotations.
+        obstacles = [c for c in schematic.components if not c.is_text]
 
         for line in schematic.lines:
             if line.status not in ("connected", "dangling"):
@@ -526,7 +570,6 @@ class SchematicReconstructor:
 
     # AMTOJ: Resolve label text for linked components
     # EVAN: Render the label overlay onto the canvas
-    # We can probably leave this until later and just do this one together using the power of friendship </3.
     def annotate_labels(
         self,
         canvas,
@@ -534,30 +577,77 @@ class SchematicReconstructor:
         show_confidence: bool = False,
     ) -> None:
         """
-        Overlay a text label on each bounding box drawn by draw_components().
-        If a component has a linked_text value, that is shown in place of the
-        raw class name. Appends the confidence score when show_confidence=True.
+        Two kinds of labels are drawn:
 
-        My though originally was showing the confidence as a percentage, but that's probably low priority.
+        * **Text components** — the OCR'd string is rendered at the original
+          text bounding box with a font scale that fits the box, so a
+          handwritten "24V" re-appears at the same place and size as the
+          original label. This is the user-facing schematic annotation.
+        * **Non-text components** — a small banner above the box shows the
+          class name (or the linked OCR value when present). This is a
+          lightweight legend for debugging detections.
+
+        Junctions are skipped entirely.
 
         Parameters
         ----------
         canvas          : canvas already passed through draw_components()
         schematic       : the same Schematic used in draw_components()
-        show_confidence : whether to append "(0.87)" to each label
+        show_confidence : whether to append "(0.87)" to each banner label
         """
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.32
-        thickness = 1
-        pad = 1
         canvas_h, canvas_w = canvas.shape[:2]
+        font = cv2.FONT_HERSHEY_SIMPLEX
+
+        # ---- First pass: render OCR text at each text component's bbox ----
+        # Use Pillow so Unicode glyphs (Ω, μ, °, ...) render correctly. We
+        # blit the text onto a PIL image wrapping the same numpy buffer.
+        text_items: list[tuple[str, int, int, int, int]] = []
+        for component in schematic.components:
+            if not component.is_text:
+                continue
+            if component.text is None:
+                continue
+            text = component.text.strip()
+            if not text or text.lower() == "text":
+                continue
+            xmin, ymin, xmax, ymax = self.get_bounds(component)
+            text_items.append((text, xmin, ymin, xmax, ymax))
+
+        if text_items:
+            # cv2 canvas is BGR; PIL expects RGB. Round-trip through a
+            # numpy view so the final BGR write overwrites canvas in place.
+            rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+            pil_img = Image.fromarray(rgb)
+            draw = ImageDraw.Draw(pil_img)
+            for text, xmin, ymin, xmax, ymax in text_items:
+                box_w = max(1, xmax - xmin)
+                box_h = max(1, ymax - ymin)
+                pil_font, (tw, th), offset = self._fit_pil_font(
+                    text, box_w, box_h
+                )
+                ox, oy = offset
+                # Center glyphs inside the bbox, correcting for the glyph
+                # bearing (PIL's draw origin is top-left of the glyph's ink,
+                # minus its left/top bearings — subtracting the bbox offset
+                # puts the visible ink where we expect).
+                tx = xmin + (box_w - tw) // 2 - ox
+                ty = ymin + (box_h - th) // 2 - oy
+                draw.text((tx, ty), text, font=pil_font, fill=(0, 0, 0))
+            # Copy the result back into the cv2 canvas (BGR, in-place).
+            canvas[:, :, :] = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
+
+        # ---- Second pass: banner labels for non-text components ----
+        used_regions: list[tuple[int, int, int, int]] = []
+        banner_scale = 0.32
+        banner_thickness = 1
+        pad = 1
 
         for component in schematic.components:
-            if component.class_name.lower() in ("text", "junction"):
+            if component.is_text:
+                continue
+            if component.class_name.lower() == "junction":
                 continue
 
-            # Prefer the linked OCR text, but skip the placeholder "text"
-            # that leaks through when no OCR is present.
             if component.text is not None and component.text.lower() != "text":
                 text = component.text
             else:
@@ -567,18 +657,26 @@ class SchematicReconstructor:
                 text = f"{text} ({component.yolo_conf:.2f})"
 
             xmin, ymin, xmax, ymax = self.get_bounds(component)
-            (tw, th), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+            (tw, th), _ = cv2.getTextSize(
+                text, font, banner_scale, banner_thickness
+            )
             box_h = th + pad * 2
 
-            # Prefer above-the-box; fall back to inside-the-top when there's no room.
-            bg_x0 = xmin
+            cx = (xmin + xmax) // 2
+            bg_x0 = max(0, cx - (tw + pad * 2) // 2)
             bg_x1 = min(canvas_w, bg_x0 + tw + pad * 2)
             if ymin - box_h >= 0:
                 bg_y0 = ymin - box_h
             else:
                 bg_y0 = ymin
             bg_y1 = bg_y0 + box_h
-
+            for ux0, uy0, ux1, uy1 in used_regions:
+                overlap = not (
+                    bg_x1 < ux0 or bg_x0 > ux1 or bg_y1 < uy0 or bg_y0 > uy1
+                )
+                if overlap:
+                    bg_y0 -= box_h + 2
+                    bg_y1 = bg_y0 + box_h
             cv2.rectangle(
                 canvas,
                 (bg_x0, bg_y0),
@@ -591,11 +689,53 @@ class SchematicReconstructor:
                 text,
                 (bg_x0 + pad, bg_y1 - pad),
                 font,
-                font_scale,
+                banner_scale,
                 (255, 255, 255),
-                thickness,
+                banner_thickness,
                 cv2.LINE_AA,
             )
+            used_regions.append((bg_x0, bg_y0, bg_x1, bg_y1))
+
+    def _fit_pil_font(
+        self,
+        text: str,
+        max_w: int,
+        max_h: int,
+        max_px: int = 200,
+    ) -> tuple[ImageFont.ImageFont, tuple[int, int], tuple[int, int]]:
+        """Pick the largest TrueType font size that fits ``text`` in
+        ``max_w × max_h`` px. Falls back to PIL's default bitmap font if no
+        TTF is available.
+
+        Returns ``(font, (width, height), (offset_x, offset_y))`` where the
+        offset is the inked bbox's (left, top) so callers can correct for
+        glyph bearing when centering.
+        """
+        target_w = max(1, int(max_w * 0.95))
+        target_h = max(1, int(max_h * 0.85))
+
+        if _UNICODE_FONT_PATH is None:
+            font = ImageFont.load_default()
+            left, top, right, bottom = font.getbbox(text)
+            return font, (right - left, bottom - top), (left, top)
+
+        # Binary search the font size that fits the bbox.
+        lo, hi = 6, max_px
+        best = lo
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            font = ImageFont.truetype(_UNICODE_FONT_PATH, mid)
+            left, top, right, bottom = font.getbbox(text)
+            tw, th = right - left, bottom - top
+            if tw <= target_w and th <= target_h:
+                best = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+
+        font = ImageFont.truetype(_UNICODE_FONT_PATH, best)
+        left, top, right, bottom = font.getbbox(text)
+        return font, (right - left, bottom - top), (left, top)
 
     # ------------------------------------------------------------------
     # 6. Summary
@@ -783,6 +923,7 @@ def run_inference(
     from model_inference.wire_detect import detect_wires
     from model_inference.yolo_detection import detect_components
     from schematics.schematic import SchematicParser
+    from model_inference.text_ocr import process_schematic_with_yolo
 
     reconstructor = reconstructor or SchematicReconstructor()
     image_path = Path(image_path)
@@ -792,6 +933,9 @@ def run_inference(
         image_path=str(image_path),
     )
     schematic = SchematicParser.from_yolo_to_schematic(yolo_result)
+    schematic = process_schematic_with_yolo(
+        schematic, model_dir=Path("models/trocr-schematic-final")
+    )
     SchematicParser.save_to_xml(schematic, f"output/{image_path.stem}.xml")
 
     _cleaned, _erased, _skeleton, polylines = detect_wires(
@@ -801,7 +945,10 @@ def run_inference(
     schematic = reconstructor.filter_by_confidence(schematic)
     schematic = reconstructor.link_text_to_components(schematic)
     schematic = reconstructor.connect_components(schematic, polylines)
-    schematic = reconstructor.filter_by_class(schematic, ["text"], exclude=True)
+    # Text components are retained so annotate_labels can render the OCR'd
+    # handwriting at its original bbox. draw_components/draw_lines both skip
+    # text, and connect_components already excludes it when matching wire
+    # endpoints to components.
     schematic = reconstructor.align_components(schematic, tolerance=align)
     return schematic, len(polylines)
 
