@@ -23,13 +23,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from schematics.schematic_reconstructor import (
-    SchematicReconstructor,
-    render_schematic,
-    run_inference,
-)
+from schematics.schematic_reconstructor import SchematicReconstructor
 
-
+from parser import   render_schematic, run_inference
 DIVIDER_PX = 6           # width of the separator strip between the two panels
 DIVIDER_COLOR = (220, 220, 220)  # BGR light-gray
 HEADER_PX = 48           # height of the title banner above each panel

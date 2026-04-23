@@ -429,9 +429,23 @@ class SchematicReconstructor:
         """Return (xmin, ymin, xmax, ymax) for the component's bounding box."""
         return (component.xmin, component.ymin, component.xmax, component.ymax)
 
-    # DEPANSHU: Determine which components are electrically connected based on proximity
-    # Feel free to do this however you want, this is just a thought on how you could go about it.
     def connect_components(self, schematic: Schematic, polyLines, strict_margin=30):
+        """
+        Match polyline endpoints to nearest component bounding boxes and classify each
+        wire as connected, dangling, or orphan. 
+
+       Parameters
+        ----------
+            schematic:     Schematic containing the components to match against.
+            polyLines:     List of polylines from trace_skeleton.
+            strict_margin: Max pixel distance from a polyline endpoint to a
+                        component bounding box to count as a match.
+
+        Returns
+        ----------
+            A copy of the schematic with all polylines added as Line objects.
+        """
+
         schematic_with_lines = deepcopy(schematic)
         for polyline in polyLines:
             if len(polyline) < 2:
@@ -475,6 +489,18 @@ class SchematicReconstructor:
         return schematic_with_lines
 
     def point_to_box_distance(self, point, component):
+        """
+        Shortest Euclidean distance from a point to a component bounding box.
+
+        Parameters
+        ----------
+            point:     (x, y) pixel coordinate.
+            component: Component whose bounding box to measure against.
+
+        Returns:
+        ----------
+            Distance in pixels; 0.0 if the point is inside the box.
+        """
         x, y = point
 
         dx = max(component.xmin - x, 0, x - component.xmax)
@@ -489,6 +515,21 @@ class SchematicReconstructor:
         strict_margin=30,
         exclude_component_id: int | None = None,
     ):
+        """
+        Return the closest non-text component within strict_margin pixels of point.
+
+        Parameters
+        ----------
+            point:                (x, y) pixel coordinate.
+            components:           List of components to search.
+            strict_margin:        Maximum allowed distance in pixels.
+            exclude_component_id: Component ID to skip (avoids matching the same
+                                  component at both ends of a wire).
+
+        Returns
+        ----------
+            Nearest matching component, or None if no match is within margin.
+        """
         best_component = None
         best_distance = float("inf")
 
@@ -988,215 +1029,3 @@ class SchematicReconstructor:
         r = 60 + ((h >> 16) & 0xFF) % 180
         return (int(b), int(g), int(r))
 
-
-def visualize_schematic(schematic, output_path="output/schematic_graph.png"):
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    canvas = np.full((schematic.height, schematic.width, 3), 255, dtype=np.uint8)
-    components_by_id = {component.id: component for component in schematic.components}
-    color = (0, 180, 0)
-
-    for line in schematic.lines:
-        if line.status != "connected":
-            continue
-
-        if len(line.polyline) >= 2:
-            points = np.array(line.polyline, dtype=np.int32).reshape(-1, 1, 2)
-            cv2.polylines(
-                canvas,
-                [points],
-                isClosed=False,
-                color=color,
-                thickness=2,
-                lineType=cv2.LINE_AA,
-            )
-            continue
-
-        from_component = components_by_id[line.start_component_id]
-        to_component = components_by_id[line.end_component_id]
-
-        p1 = (
-            int(from_component.center_x),
-            int(from_component.center_y),
-        )
-        p2 = (
-            int(to_component.center_x),
-            int(to_component.center_y),
-        )
-
-        cv2.line(canvas, p1, p2, color, 2, cv2.LINE_AA)
-
-    for component in schematic.components:
-        cv2.rectangle(
-            canvas,
-            (component.xmin, component.ymin),
-            (component.xmax, component.ymax),
-            (0, 180, 255),
-            2,
-        )
-
-        cv2.putText(
-            canvas,
-            component.class_name,
-            (component.xmin, max(15, component.ymin - 5)),
-            cv2.FONT_HERSHEY_TRIPLEX,
-            0.45,
-            (0, 0, 0),
-            1,
-            cv2.LINE_AA,
-        )
-
-    cv2.imwrite(str(output_path), canvas)
-
-
-# ---------------------------------------------------------------------------
-# High-level pipeline helpers
-# ---------------------------------------------------------------------------
-
-WIRE_MODEL_PATH = "models/unet_best.pth"
-YOLO_MODEL_PATH = "models/yolo.pt"
-
-
-def run_inference(
-    image_path: str | Path,
-    reconstructor: "SchematicReconstructor | None" = None,
-    align: int | None = None,
-    yolo_model_path: str = YOLO_MODEL_PATH,
-    wire_model_path: str = WIRE_MODEL_PATH,
-) -> tuple[Schematic, int]:
-    """Run YOLO + wire detection + filtering + alignment on ``image_path``.
-
-    Returns the finalised ``Schematic`` plus the raw polyline count (useful
-    for logging). The image's detected component XML is also written to
-    ``output/<stem>.xml`` as a side-effect, matching the existing pipeline.
-    """
-    from model_inference.wire_detect import detect_wires
-    from model_inference.yolo_detection import detect_components
-    from schematics.schematic import SchematicParser
-    from model_inference.text_ocr import process_schematic_with_yolo
-
-    reconstructor = reconstructor or SchematicReconstructor()
-    image_path = Path(image_path)
-
-    yolo_result = detect_components(
-        model_path=yolo_model_path,
-        image_path=str(image_path),
-    )
-    schematic = SchematicParser.from_yolo_to_schematic(yolo_result)
-    schematic = process_schematic_with_yolo(
-        schematic, model_dir=Path("models/trocr-schematic-final")
-    )
-    SchematicParser.save_to_xml(schematic, f"output/{image_path.stem}.xml")
-
-    _cleaned, _erased, _skeleton, polylines = detect_wires(
-        image_path, schematic, wire_model_path
-    )
-
-    schematic = reconstructor.filter_by_confidence(schematic)
-    schematic = reconstructor.link_text_to_components(schematic)
-    schematic = reconstructor.connect_components(schematic, polylines)
-    # Text components are retained so annotate_labels can render the OCR'd
-    # handwriting at its original bbox. draw_components/draw_lines both skip
-    # text, and connect_components already excludes it when matching wire
-    # endpoints to components.
-    #
-    # Wire-based alignment runs first to collapse tilt-induced staircases
-    # (transitively-connected components share an axis). Proximity-based
-    # alignment then mops up small residual gaps for components that the
-    # wire graph didn't link.
-    schematic = reconstructor.align_components_by_wires(schematic)
-    schematic = reconstructor.align_components(schematic, tolerance=align)
-    return schematic, len(polylines)
-
-
-def render_schematic(
-    schematic: Schematic,
-    labels: bool = True,
-    reconstructor: "SchematicReconstructor | None" = None,
-) -> np.ndarray:
-    """Render ``schematic`` to a fresh BGR canvas and return it."""
-    reconstructor = reconstructor or SchematicReconstructor()
-    canvas = reconstructor.render_canvas(schematic)
-    reconstructor.draw_components(canvas, schematic)
-    reconstructor.draw_lines(canvas, schematic)
-    if labels:
-        reconstructor.annotate_labels(canvas, schematic)
-    return canvas
-
-
-if __name__ == "__main__":
-    import argparse
-
-    arg_parser = argparse.ArgumentParser(description="Reconstruct a schematic image.")
-    arg_parser.add_argument(
-        "--image",
-        type=Path,
-        default=None,
-        help="Input schematic image. If omitted, all .png/.jpg in tests/images/ are processed.",
-    )
-    arg_parser.add_argument(
-        "--output",
-        type=Path,
-        default=None,
-        help="Output image path (single-image mode only; default: tests/outputs/<stem>_reconstructed.png).",
-    )
-    labels_group = arg_parser.add_mutually_exclusive_group()
-    labels_group.add_argument(
-        "--labels",
-        dest="labels",
-        action="store_true",
-        help="Draw component labels (default).",
-    )
-    labels_group.add_argument(
-        "--no-labels",
-        dest="labels",
-        action="store_false",
-        help="Skip drawing labels.",
-    )
-    arg_parser.set_defaults(labels=True)
-    arg_parser.add_argument(
-        "--align",
-        type=int,
-        default=None,
-        help="Alignment tolerance (px) for clustering nearby component centers "
-        "onto a shared axis. 0 disables alignment. Default: adaptive to image width.",
-    )
-    args = arg_parser.parse_args()
-
-    if args.image is not None:
-        images = [args.image]
-    else:
-        images_dir = Path("tests/images")
-        images = sorted(
-            p
-            for p in images_dir.iterdir()
-            if p.suffix.lower() in (".png", ".jpg", ".jpeg")
-        )
-        if not images:
-            raise SystemExit(f"No .png/.jpg images found in {images_dir}")
-
-    reconstructor = SchematicReconstructor()
-    suffix = "_reconstructed" if args.labels else "_nolabels"
-
-    for image_path in images:
-        if args.output is not None and len(images) == 1:
-            output_path = args.output
-        else:
-            output_path = Path(f"tests/outputs/{image_path.stem}{suffix}.png")
-
-        schematic, n_polys = run_inference(
-            image_path,
-            reconstructor=reconstructor,
-            align=args.align,
-        )
-        canvas = render_schematic(
-            schematic, labels=args.labels, reconstructor=reconstructor
-        )
-        reconstructor.export_image(canvas, output_path)
-
-        print(
-            f"Wrote {output_path}  (labels={'on' if args.labels else 'off'}, "
-            f"polylines={n_polys})"
-        )
-        print(f"  Counts: {reconstructor.summarise(schematic)}")

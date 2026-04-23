@@ -161,9 +161,9 @@ cython_debug/
 
 data/*
 
-models/*
 archive-2/*
 output/*
 runs/*
 .envrc
-trocr-schematic-final/*
+
+processing_steps/*
