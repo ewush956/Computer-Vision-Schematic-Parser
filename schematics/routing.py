@@ -34,10 +34,10 @@ from typing import Iterable
 
 # --- Tunables ---------------------------------------------------------------
 
-GRID = 8           # pixels per grid cell
-BEND_PENALTY = 5   # extra cost incurred when the route changes direction
-OBSTACLE_PAD = 3   # pixels added around every component bbox before rasterising
-SEARCH_MARGIN = 10 # grid cells of slack around the start/end bbox
+GRID = 8  # pixels per grid cell
+BEND_PENALTY = 5  # extra cost incurred when the route changes direction
+OBSTACLE_PAD = 3  # pixels added around every component bbox before rasterising
+SEARCH_MARGIN = 10  # grid cells of slack around the start/end bbox
 
 Point = tuple[int, int]
 Direction = tuple[int, int]
@@ -46,6 +46,7 @@ _DIRECTIONS: tuple[Direction, ...] = ((GRID, 0), (-GRID, 0), (0, GRID), (0, -GRI
 
 
 # --- Grid helpers -----------------------------------------------------------
+
 
 def _snap(value: float, grid: int = GRID) -> int:
     """Round ``value`` to the nearest multiple of ``grid``."""
@@ -64,9 +65,9 @@ def _manhattan(a: Point, b: Point) -> int:
 
 # Outward direction vectors for each named port side.
 _PORT_OUTWARD: dict[str, Direction] = {
-    "left":   (-GRID, 0),
-    "right":  (GRID, 0),
-    "top":    (0, -GRID),
+    "left": (-GRID, 0),
+    "right": (GRID, 0),
+    "top": (0, -GRID),
     "bottom": (0, GRID),
 }
 
@@ -86,9 +87,9 @@ def get_ports(component) -> dict[str, Point]:
     cx = (component.xmin + component.xmax) / 2.0
     cy = (component.ymin + component.ymax) / 2.0
     return {
-        "left":   snap_point((component.xmin, cy)),
-        "right":  snap_point((component.xmax, cy)),
-        "top":    snap_point((cx, component.ymin)),
+        "left": snap_point((component.xmin, cy)),
+        "right": snap_point((component.xmax, cy)),
+        "top": snap_point((cx, component.ymin)),
         "bottom": snap_point((cx, component.ymax)),
     }
 
@@ -98,9 +99,7 @@ def port_outward(side: str) -> Direction:
     return _PORT_OUTWARD[side]
 
 
-def select_port_pair(
-    from_comp, to_comp
-) -> tuple[tuple[Point, str], tuple[Point, str]]:
+def select_port_pair(from_comp, to_comp) -> tuple[tuple[Point, str], tuple[Point, str]]:
     """Pick the ((from_port, from_side), (to_port, to_side)) pair with
     minimum Manhattan distance."""
     best: tuple[tuple[Point, str], tuple[Point, str]] | None = None
@@ -121,10 +120,13 @@ def nearest_port(component, target: Point) -> tuple[Point, str]:
     return min(
         get_ports(component).items(),
         key=lambda kv: _manhattan(kv[1], target_snapped),
-    )[::-1]  # items() yields (side, point); we want (point, side)
+    )[
+        ::-1
+    ]  # items() yields (side, point); we want (point, side)
 
 
 # --- Obstacle map -----------------------------------------------------------
+
 
 def build_blocked_cells(
     components: Iterable,
@@ -160,6 +162,7 @@ def is_blocked(point: Point, blocked: set[Point]) -> bool:
 
 # --- Path post-processing ---------------------------------------------------
 
+
 def simplify_path(path: list[Point]) -> list[Point]:
     """Collapse runs of collinear points down to their endpoints.
 
@@ -182,7 +185,202 @@ def simplify_path(path: list[Point]) -> list[Point]:
     return out
 
 
+# --- Polyline orthogonalization ---------------------------------------------
+#
+# These helpers take the freeform polyline traced from the wire-mask skeleton
+# and turn it into a clean axis-aligned route. The detected polyline already
+# follows the user's drawing, so we don't need to invent a new path — we just
+# need to (a) drop hand-drawn wobble via Douglas-Peucker, (b) snap each
+# remaining segment to whichever axis dominates its displacement, and (c)
+# collapse any resulting collinear runs.
+
+
+def _perp_distance(p: Point, a: Point, b: Point) -> float:
+    """Perpendicular distance from ``p`` to the segment a-b."""
+    if a == b:
+        dx, dy = p[0] - a[0], p[1] - a[1]
+        return (dx * dx + dy * dy) ** 0.5
+    # Normal vector to a-b.
+    nx, ny = b[1] - a[1], a[0] - b[0]
+    norm = (nx * nx + ny * ny) ** 0.5
+    return abs((p[0] - a[0]) * nx + (p[1] - a[1]) * ny) / norm
+
+
+def douglas_peucker(points: list[Point], epsilon: float = 5.0) -> list[Point]:
+    """Standard Douglas-Peucker polyline simplification.
+
+    Iterative implementation to avoid Python recursion limits on long
+    skeleton traces.
+    """
+    if len(points) < 3:
+        return list(points)
+
+    keep = [False] * len(points)
+    keep[0] = keep[-1] = True
+    stack: list[tuple[int, int]] = [(0, len(points) - 1)]
+    while stack:
+        i, j = stack.pop()
+        if j <= i + 1:
+            continue
+        a, b = points[i], points[j]
+        max_d = 0.0
+        max_k = -1
+        for k in range(i + 1, j):
+            d = _perp_distance(points[k], a, b)
+            if d > max_d:
+                max_d = d
+                max_k = k
+        if max_d > epsilon and max_k != -1:
+            keep[max_k] = True
+            stack.append((i, max_k))
+            stack.append((max_k, j))
+
+    return [p for p, k in zip(points, keep) if k]
+
+
+def _collapse_orthogonal_collinear(pts: list[Point]) -> list[Point]:
+    """Same as :func:`simplify_path` but dedupes consecutive identical points
+    too, orthogonalization can produce zero-length steps."""
+    if not pts:
+        return []
+    out: list[Point] = [pts[0]]
+    for p in pts[1:]:
+        if p == out[-1]:
+            continue
+        if len(out) >= 2:
+            ax, ay = out[-2]
+            bx, by = out[-1]
+            cx, cy = p
+            if (ax == bx == cx) or (ay == by == cy):
+                # Replace the middle point — a, b, c are collinear.
+                out[-1] = p
+                continue
+        out.append(p)
+    return out
+
+
+def orthogonalize_polyline(
+    polyline: list[Point],
+    simplify_epsilon: float = 6.0,
+) -> list[Point]:
+    """Convert a freeform polyline into a strictly axis-aligned polyline.
+
+    1. Douglas-Peucker simplifies the trace to its load-bearing vertices.
+    2. Each remaining segment is forced onto whichever axis its displacement
+       dominates (|dx| >= |dy| → horizontal, else vertical). This means a
+       slightly-slanted hand-drawn line becomes perfectly straight.
+    3. Bends between segments share endpoints, so the result is one
+       continuous path of horizontal and vertical strokes.
+    """
+    if len(polyline) < 2:
+        return list(polyline)
+
+    pts = douglas_peucker(polyline, simplify_epsilon)
+    if len(pts) < 2:
+        return list(pts)
+
+    out: list[Point] = [pts[0]]
+    cx, cy = pts[0]
+    for nx, ny in pts[1:]:
+        dx = abs(nx - cx)
+        dy = abs(ny - cy)
+        if dx == 0 and dy == 0:
+            continue
+        if dx >= dy:
+            cx = nx  # horizontal segment, keep current y
+        else:
+            cy = ny  # vertical segment, keep current x
+        out.append((cx, cy))
+
+    return _collapse_orthogonal_collinear(out)
+
+
+def snap_endpoint_to_port(
+    polyline: list[Point],
+    at_start: bool,
+    port: Point,
+    port_outward: Direction,
+    tolerance: int = 40,
+) -> list[Point]:
+    """Slide the terminal segment of an orthogonal polyline onto the port's
+    entry axis when the two are nearly aligned.
+
+    The detected polyline often ends a few pixels off the matched port's
+    edge. Without this, ``stub_to_port`` would have to introduce a small
+    perpendicular jog right at the component join. When the terminal
+    segment runs *parallel* to the wire's required entry axis (e.g. last
+    segment is horizontal and the port is on a left/right edge), and its
+    perpendicular coord is within ``tolerance`` of the port's, slide both
+    endpoints of that segment so they share the port's coord — eliminating
+    the jog and turning the stub into a straight extension.
+
+    The segment preceding the terminal one is necessarily perpendicular,
+    so it just gets longer/shorter; topology is preserved.
+
+    Returns a new list (a copy, even when no snap was applied).
+    """
+    pts = list(polyline)
+    if len(pts) < 2:
+        return pts
+
+    end_i = 0 if at_start else len(pts) - 1
+    adj_i = 1 if at_start else len(pts) - 2
+
+    end_pt = pts[end_i]
+    adj_pt = pts[adj_i]
+    seg_horizontal = end_pt[1] == adj_pt[1]
+    seg_vertical = end_pt[0] == adj_pt[0]
+    # Left/right ports want a horizontal entry; top/bottom want vertical.
+    port_on_horizontal_edge = port_outward[0] != 0
+
+    if port_on_horizontal_edge and seg_horizontal:
+        if abs(end_pt[1] - port[1]) <= tolerance:
+            new_y = port[1]
+            pts[end_i] = (end_pt[0], new_y)
+            pts[adj_i] = (adj_pt[0], new_y)
+    elif (not port_on_horizontal_edge) and seg_vertical:
+        if abs(end_pt[0] - port[0]) <= tolerance:
+            new_x = port[0]
+            pts[end_i] = (new_x, end_pt[1])
+            pts[adj_i] = (new_x, adj_pt[1])
+
+    return pts
+
+
+def stub_to_port(
+    inner: Point,
+    port: Point,
+    port_outward: Direction | None = None,
+) -> list[Point]:
+    """Return a short orthogonal path from a polyline endpoint ``inner`` out
+    to a component ``port``.
+
+    * Empty / coincident → ``[inner]``.
+    * Already collinear (shared x or y) → straight ``[inner, port]``.
+    * Otherwise an L-bend. The bend axis is chosen to leave the port
+      perpendicular to the component edge when ``port_outward`` is supplied
+      (so a left/right port exits horizontally first, a top/bottom port
+      exits vertically first).
+    """
+    ix, iy = inner
+    px, py = port
+    if (ix, iy) == (px, py):
+        return [inner]
+    if ix == px or iy == py:
+        return [inner, port]
+    if port_outward is not None and port_outward[0] != 0:
+        # Left/right port: the segment touching the port must be horizontal.
+        bend = (ix, py)
+    elif port_outward is not None and port_outward[1] != 0:
+        # Top/bottom port: the segment touching the port must be vertical.
+        bend = (px, iy)
+    else:
+        bend = (px, iy)
+    return [inner, bend, port]
+
+
 # --- Straight-Z fast path ---------------------------------------------------
+
 
 def _z_route(
     start: Point,
@@ -238,6 +436,7 @@ def _path_is_clear(path: list[Point], blocked: set[Point]) -> bool:
 
 
 # --- A* ---------------------------------------------------------------------
+
 
 def astar_route(
     start: Point,

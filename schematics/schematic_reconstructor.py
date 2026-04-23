@@ -125,97 +125,238 @@ class SchematicReconstructor:
     def align_components(
         self, schematic: Schematic, tolerance: int | None = None
     ) -> Schematic:
-        """
-        Cluster component centers along each axis independently and snap
-        every member of a cluster to the cluster mean. Two components whose
-        centers differ by less than ``tolerance`` on one axis are forced to
-        share that axis — so Manhattan routing between them collapses to a
-        single straight segment instead of a small dog-leg.
+        """Snap component centers onto shared axes using **wire connectivity**.
 
-        Clustering is done by sorting the axis values and cutting a new
-        cluster whenever the gap between consecutive values exceeds
-        ``tolerance``.
+        The previous implementation clustered components by spatial
+        proximity, which works for tightly-spaced rows but breaks down when
+        the source image is tilted a few degrees — cumulative drift across
+        a row of 5 components exceeds the per-pair tolerance, the chain
+        splits, and the resulting wires get short jogs at every junction.
 
-        Text components are excluded from clustering: their centers are
-        often off-grid relative to the real symbols, and shifting them would
-        move OCR'd labels away from where the writer placed them.
+        The connectivity-aware approach:
+
+        1. Classify each *connected* wire by dominant displacement of its
+           endpoints: ``|dx| > 2·|dy|`` is horizontal, ``|dy| > 2·|dx|`` is
+           vertical, anything in between is diagonal and skipped.
+        2. A horizontal wire imposes "share y" on its two endpoint
+           components; a vertical wire imposes "share x".
+        3. Resolve each constraint graph via union-find: every transitive
+           group of share-y components is snapped to its members' mean
+           y-coord (same for x, independently).
+
+        This handles tilted rows directly — 5 components daisy-chained by
+        horizontal wires land on one y because they're all in the same
+        union-find group, regardless of how far the first and last drift.
+
+        Text components are excluded from alignment; their bboxes are
+        positioned where the writer placed the label, not on a wire axis.
 
         Parameters
         ----------
-        tolerance : maximum center-to-center gap (px) that still counts as
-                    "aligned". Defaults to 8 px, which keeps closely-spaced
-                    components from collapsing onto each other while still
-                    straightening wire rows/columns.
+        tolerance : kept for CLI compatibility. ``0`` disables alignment;
+                    any other value (including ``None``) runs the
+                    connectivity-based pass.
         """
-        if tolerance is None:
-            tolerance = 8
-        if tolerance <= 0 or not schematic.components:
+        if tolerance == 0:
+            return schematic
+        if not schematic.components or not schematic.lines:
             return schematic
 
-        comps = [c for c in schematic.components if not c.is_text]
-        if not comps:
+        comps_by_id = {c.id: c for c in schematic.components if not c.is_text}
+        if not comps_by_id:
             return schematic
 
-        def spans_overlap(a0: int, a1: int, b0: int, b1: int) -> bool:
-            return a1 > b0 and b1 > a0
+        y_pairs: list[tuple[int, int]] = []  # horizontal wire → share y
+        x_pairs: list[tuple[int, int]] = []  # vertical wire   → share x
 
-        def cluster_means_guarded(
-            values: list[float], other_spans: list[tuple[int, int]], tol: int
-        ) -> list[float]:
-            """Cluster by axis value, but never merge two components whose
-            bboxes already overlap on the OTHER axis — collapsing their
-            value here would stack them on top of each other.
-            """
-            order = sorted(range(len(values)), key=lambda i: values[i])
-            result = [0.0] * len(values)
-            i = 0
-            while i < len(order):
-                cluster = [order[i]]
-                j = i + 1
-                while j < len(order) and values[order[j]] - values[order[j - 1]] <= tol:
-                    cand = order[j]
-                    c0, c1 = other_spans[cand]
-                    if any(
-                        spans_overlap(c0, c1, other_spans[m][0], other_spans[m][1])
-                        for m in cluster
-                    ):
-                        break
-                    cluster.append(cand)
-                    j += 1
-                mean = sum(values[k] for k in cluster) / len(cluster)
-                for k in cluster:
-                    result[k] = mean
-                i = j
-            return result
+        for line in schematic.lines:
+            if line.status != "connected":
+                continue
+            if line.start_component_id is None or line.end_component_id is None:
+                continue
+            if line.start_component_id == line.end_component_id:
+                continue
+            if (
+                line.start_component_id not in comps_by_id
+                or line.end_component_id not in comps_by_id
+            ):
+                continue
+            if len(line.polyline) < 2:
+                continue
 
-        centers_x = [(c.xmin + c.xmax) / 2.0 for c in comps]
-        centers_y = [(c.ymin + c.ymax) / 2.0 for c in comps]
-        x_spans = [(c.xmin, c.xmax) for c in comps]
-        y_spans = [(c.ymin, c.ymax) for c in comps]
+            # Use the overall endpoint-to-endpoint displacement, not any
+            # single segment — a hand-drawn bus with small wobbles still
+            # classifies cleanly by its net direction.
+            x0, y0 = line.polyline[0]
+            x1, y1 = line.polyline[-1]
+            dx, dy = abs(x1 - x0), abs(y1 - y0)
 
-        # When clustering x-centers, forbid merges that already overlap in y
-        # (same row → collapsing x would stack them). And vice versa.
-        new_x = cluster_means_guarded(centers_x, y_spans, tolerance)
-        new_y = cluster_means_guarded(centers_y, x_spans, tolerance)
+            if dx > 2 * dy:
+                y_pairs.append((line.start_component_id, line.end_component_id))
+            elif dy > 2 * dx:
+                x_pairs.append((line.start_component_id, line.end_component_id))
+            # else: diagonal — skip.
 
-        # Mutate in place: the Schematic dataclass doesn't expose a way to
-        # rebuild with preserved IDs without poking at internal state, and
-        # Component is a plain dataclass so attribute assignment is fine.
-        for c, nx, ny in zip(comps, new_x, new_y):
-            # Integer cluster centers, matched against the int center the
-            # snap routine computes: (xmin+xmax)//2. Using the same formula
-            # here guarantees every cluster member ends with the exact same
-            # integer center — no 1-px jitter between aligned wires.
-            target_cx = int(round(nx))
-            target_cy = int(round(ny))
-            old_cx = (c.xmin + c.xmax) // 2
-            old_cy = (c.ymin + c.ymax) // 2
-            dx = target_cx - old_cx
-            dy = target_cy - old_cy
-            c.xmin += dx
-            c.xmax += dx
+        def snap_axis(
+            pairs: list[tuple[int, int]],
+            get_center: callable,
+            shift: callable,
+        ) -> None:
+            """Union-find over ``pairs``; snap each group to its mean."""
+            parent = {cid: cid for cid in comps_by_id}
+
+            def find(a: int) -> int:
+                while parent[a] != a:
+                    parent[a] = parent[parent[a]]
+                    a = parent[a]
+                return a
+
+            def union(a: int, b: int) -> None:
+                ra, rb = find(a), find(b)
+                if ra != rb:
+                    parent[ra] = rb
+
+            for a, b in pairs:
+                union(a, b)
+
+            groups: dict[int, list[int]] = {}
+            for cid in comps_by_id:
+                groups.setdefault(find(cid), []).append(cid)
+
+            for members in groups.values():
+                if len(members) < 2:
+                    continue
+                mean = sum(get_center(comps_by_id[m]) for m in members) / len(members)
+                target = int(round(mean))
+                for cid in members:
+                    shift(comps_by_id[cid], target)
+
+        def shift_y(c, new_cy: int) -> None:
+            dy = new_cy - (c.ymin + c.ymax) // 2
             c.ymin += dy
             c.ymax += dy
+
+        def shift_x(c, new_cx: int) -> None:
+            dx = new_cx - (c.xmin + c.xmax) // 2
+            c.xmin += dx
+            c.xmax += dx
+
+        snap_axis(y_pairs, lambda c: (c.ymin + c.ymax) // 2, shift_y)
+        snap_axis(x_pairs, lambda c: (c.xmin + c.xmax) // 2, shift_x)
+
+        return schematic
+
+    def align_components_by_wires(
+        self,
+        schematic: Schematic,
+        ratio_threshold: float = 2.0,
+    ) -> Schematic:
+        """Snap component centers onto shared axes based on wire connectivity.
+
+        For each connected wire whose dominant axis dominates the
+        perpendicular by at least ``ratio_threshold``, treat its two
+        endpoint components as constrained to share that axis. Constraints
+        accumulate in two union-find structures (one per axis); each
+        cluster is then snapped to its mean coordinate.
+
+        Compared to the proximity-based :meth:`align_components`, this
+        bridges *transitive* alignment across long chains — a slightly
+        tilted row of five components connected by horizontal wires gets
+        collapsed onto one shared y, regardless of how far the endpoints
+        drift from each other. That's the main fix for camera tilt.
+
+        Mutates the schematic in place; text components are untouched.
+
+        Parameters
+        ----------
+        ratio_threshold : minimum dominant/perpendicular displacement
+                          ratio for a wire to count as a directional
+                          constraint. 2.0 means a wire must be twice as
+                          long along its dominant axis as the other.
+                          Diagonals (ratio < threshold on both axes)
+                          contribute no constraint.
+        """
+        if not schematic.lines:
+            return schematic
+
+        components_by_id = {
+            c.id: c for c in schematic.components if not c.is_text
+        }
+        if not components_by_id:
+            return schematic
+
+        # Per-axis union-find. Each component starts in its own cluster.
+        x_parent: dict[int, int] = {cid: cid for cid in components_by_id}
+        y_parent: dict[int, int] = {cid: cid for cid in components_by_id}
+
+        def find(parent: dict[int, int], x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]  # path compression
+                x = parent[x]
+            return x
+
+        def union(parent: dict[int, int], a: int, b: int) -> None:
+            ra, rb = find(parent, a), find(parent, b)
+            if ra != rb:
+                parent[ra] = rb
+
+        for line in schematic.lines:
+            if line.status != "connected":
+                continue
+            a_id = line.start_component_id
+            b_id = line.end_component_id
+            if a_id is None or b_id is None or a_id == b_id:
+                continue
+            if a_id not in components_by_id or b_id not in components_by_id:
+                continue
+            if not line.polyline or len(line.polyline) < 2:
+                continue
+
+            # First-to-last displacement classifies the wire's overall
+            # direction; mid-segment wobble doesn't matter here.
+            x0, y0 = line.polyline[0]
+            x1, y1 = line.polyline[-1]
+            dx = abs(x1 - x0)
+            dy = abs(y1 - y0)
+            if dx >= ratio_threshold * max(dy, 1):
+                union(y_parent, a_id, b_id)  # horizontal wire ⇒ shared y
+            elif dy >= ratio_threshold * max(dx, 1):
+                union(x_parent, a_id, b_id)  # vertical wire ⇒ shared x
+
+        def cluster_means(
+            parent: dict[int, int],
+            value_of: "callable",
+        ) -> dict[int, int]:
+            clusters: dict[int, list[int]] = {}
+            for cid in parent:
+                clusters.setdefault(find(parent, cid), []).append(cid)
+            means: dict[int, int] = {}
+            for members in clusters.values():
+                mean = sum(value_of(components_by_id[m]) for m in members) / len(members)
+                snapped = int(round(mean))
+                for m in members:
+                    means[m] = snapped
+            return means
+
+        new_x = cluster_means(x_parent, lambda c: (c.xmin + c.xmax) / 2)
+        new_y = cluster_means(y_parent, lambda c: (c.ymin + c.ymax) / 2)
+
+        # Shift each component so its center matches its cluster mean. The
+        # polyline vertices are intentionally left alone — orthogonalization
+        # plus snap_endpoint_to_port will bridge the small gap between the
+        # detected wire endpoint and the shifted port.
+        for cid, comp in components_by_id.items():
+            old_cx = (comp.xmin + comp.xmax) // 2
+            old_cy = (comp.ymin + comp.ymax) // 2
+            dx = new_x[cid] - old_cx
+            dy = new_y[cid] - old_cy
+            if dx == 0 and dy == 0:
+                continue
+            comp.xmin += dx
+            comp.xmax += dx
+            comp.ymin += dy
+            comp.ymax += dy
+
         return schematic
 
     # AMTOJ: Spatially associate each "text" detection with its nearest non-text component
@@ -487,22 +628,21 @@ class SchematicReconstructor:
 
     # EVAN: Draw arrows between connected components on the canvas
     def draw_lines(self, canvas, schematic: Schematic) -> None:
-        """Render every Line as an orthogonal A*-routed polyline.
+        """Render every Line by orthogonalizing the *detected* polyline.
 
-        Routing happens on an 8-px grid (see :mod:`schematics.routing`):
+        Strategy (see :mod:`schematics.routing`):
 
-        1. Choose the port pair on the two components that minimises
-           Manhattan distance.
-        2. A* search avoids every other component's bounding box.
-        3. Collinear waypoints are collapsed so the final polyline is only
-           endpoints and bends.
+        1. Simplify the raw skeleton trace with Douglas-Peucker to drop
+           hand-drawn jitter.
+        2. Snap each remaining segment to its dominant axis so the wire
+           becomes strictly horizontal/vertical.
+        3. Bridge the polyline's endpoints to the matched component ports
+           with a short orthogonal stub (straight or single L-bend).
 
-        Dangling wires (only one matched end) are routed from the matched
-        component's nearest port to the traced endpoint.
+        This preserves the topology the user actually drew — no port-to-port
+        re-routing, no gratuitous bends from grid snapping.
         """
         components_by_id = {c.id: c for c in schematic.components}
-        # Text bboxes shouldn't deflect wires — they're just annotations.
-        obstacles = [c for c in schematic.components if not c.is_text]
 
         for line in schematic.lines:
             if line.status not in ("connected", "dangling"):
@@ -513,7 +653,7 @@ class SchematicReconstructor:
             from_comp = components_by_id.get(line.start_component_id)
             to_comp = components_by_id.get(line.end_component_id)
 
-            route = self._route_line(line, from_comp, to_comp, obstacles)
+            route = self._route_line(line, from_comp, to_comp)
             if route is None or len(route) < 2:
                 continue
 
@@ -528,45 +668,56 @@ class SchematicReconstructor:
             )
 
     def _route_line(
-        self, line, from_comp, to_comp, obstacles
+        self, line, from_comp, to_comp
     ) -> list[tuple[int, int]] | None:
-        """Return an orthogonal grid route for ``line``, or None if unroutable."""
-        start_dir = None
-        end_dir = None
-        exclude_ids: set[int] = set()
+        """Build an orthogonalized path that follows ``line.polyline``,
+        with short stubs attaching its endpoints to the matched component
+        ports.
 
-        if from_comp is not None and to_comp is not None:
-            (start, from_side), (end, to_side) = routing.select_port_pair(
-                from_comp, to_comp
-            )
-            start_dir = routing.port_outward(from_side)
-            # end_dir is the step *into* the end port, i.e. opposite the
-            # port's outward direction.
-            ox, oy = routing.port_outward(to_side)
-            end_dir = (-ox, -oy)
-            exclude_ids = {from_comp.id, to_comp.id}
-        elif from_comp is not None:
-            start, from_side = routing.nearest_port(from_comp, line.polyline[-1])
-            end = routing.snap_point(line.polyline[-1])
-            start_dir = routing.port_outward(from_side)
-            exclude_ids = {from_comp.id}
-        elif to_comp is not None:
-            start = routing.snap_point(line.polyline[0])
-            end, to_side = routing.nearest_port(to_comp, line.polyline[0])
-            ox, oy = routing.port_outward(to_side)
-            end_dir = (-ox, -oy)
-            exclude_ids = {to_comp.id}
-        else:
+        Returns ``None`` when the line has no matched endpoint at all
+        (orphan lines are filtered upstream, but be defensive).
+        """
+        if from_comp is None and to_comp is None:
             return None
 
-        return routing.route_line(
-            start,
-            end,
-            obstacles,
-            exclude_ids=exclude_ids,
-            start_dir=start_dir,
-            end_dir=end_dir,
-        )
+        ortho = routing.orthogonalize_polyline(line.polyline)
+        if len(ortho) < 2:
+            return None
+
+        # Resolve the port pair first so we can axis-snap the polyline's
+        # terminal segments onto the ports' entry axes. This eliminates the
+        # tiny perpendicular jog the stub would otherwise need when the
+        # detected wire ends a few pixels off the matched component edge.
+        start_port = end_port = None
+        start_outward = end_outward = None
+
+        if from_comp is not None:
+            start_port, start_side = routing.nearest_port(from_comp, ortho[0])
+            start_outward = routing.port_outward(start_side)
+            ortho = routing.snap_endpoint_to_port(
+                ortho, at_start=True, port=start_port, port_outward=start_outward
+            )
+
+        if to_comp is not None:
+            end_port, end_side = routing.nearest_port(to_comp, ortho[-1])
+            end_outward = routing.port_outward(end_side)
+            ortho = routing.snap_endpoint_to_port(
+                ortho, at_start=False, port=end_port, port_outward=end_outward
+            )
+
+        path: list[tuple[int, int]] = list(ortho)
+
+        if start_port is not None:
+            stub = routing.stub_to_port(ortho[0], start_port, start_outward)
+            # stub goes inner -> port; reverse and drop the duplicate inner.
+            path = list(reversed(stub))[:-1] + path
+
+        if end_port is not None:
+            stub = routing.stub_to_port(ortho[-1], end_port, end_outward)
+            # stub goes inner -> port; drop the duplicate inner.
+            path = path + stub[1:]
+
+        return routing.simplify_path(path)
 
     # AMTOJ: Resolve label text for linked components
     # EVAN: Render the label overlay onto the canvas
@@ -949,6 +1100,12 @@ def run_inference(
     # handwriting at its original bbox. draw_components/draw_lines both skip
     # text, and connect_components already excludes it when matching wire
     # endpoints to components.
+    #
+    # Wire-based alignment runs first to collapse tilt-induced staircases
+    # (transitively-connected components share an axis). Proximity-based
+    # alignment then mops up small residual gaps for components that the
+    # wire graph didn't link.
+    schematic = reconstructor.align_components_by_wires(schematic)
     schematic = reconstructor.align_components(schematic, tolerance=align)
     return schematic, len(polylines)
 
