@@ -165,4 +165,5 @@ models/*
 archive-2/*
 output/*
 runs/*
+.envrc
 trocr-schematic-final/*

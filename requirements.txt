@@ -9,6 +9,10 @@ seaborn
 numpy
 pandas
 Pillow
+opencv-python
+matplotlib>=3.7.0
+onnxruntime>=1.17.0
+pytest>=8.0.0
 shapely
 segmentation-models-pytorch
 albumentations

@@ -82,7 +82,9 @@ class Line:
     polyline: Polyline
     start_component_id: int | None = None
     end_component_id: int | None = None
-    status: str = "orphan" # Can be orphan(if not connected to any at all), connected or dangling( if only conencted to one)
+    status: str = (
+        "orphan"  # Can be orphan(if not connected to any at all), connected or dangling( if only conencted to one)
+    )
 
 
 @dataclass
@@ -97,9 +99,6 @@ class Schematic:
     components: list[Component] = field(default_factory=list)
     lines: list[Line] = field(default_factory=list)
     _id_counter: Iterator[int] = field(default_factory=count, init=False, repr=False)
-
-
-
 
     def _new_id(self) -> int:
         return next(self._id_counter)
@@ -164,7 +163,7 @@ class Schematic:
 
 
 class SchematicParser:
-    """ 
+    """
     Utility class for converting schematics from various representations
     """
 
@@ -228,7 +227,7 @@ class SchematicParser:
         schematic = Schematic(width=w, height=h, image_path=str(result.path))
         if result.boxes is None:
             return schematic
-        
+
         for box in result.boxes:
             x1, y1, x2, y2 = box.xyxy[0].tolist()
             schematic.add_component(
