@@ -112,7 +112,6 @@ class Schematic:
         xmax: int,
         ymax: int,
         text: str | None = None,
-        ocr_conf: float | None = None,
         text_type: str | None = None,
     ) -> Component:
         component = Component(
@@ -169,7 +168,7 @@ class SchematicParser:
 
     @staticmethod
     def save_to_xml(schematic: Schematic, output_path: str | Path) -> None:
-        """W
+        """
         Writes a Schematic object to the pipeline XML format
         """
         root = ET.Element(

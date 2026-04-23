@@ -1,99 +1,84 @@
 import argparse
 import xml.etree.ElementTree as ET
 from pathlib import Path
-
 import cv2
 import numpy as np
-
-from model_inference.text_ocr import process_schematic_with_yolo
 from model_inference.wire_detect import detect_wires
 from model_inference.yolo_detection import detect_components
-# from model_inference.text_ocr import resolve_text_annotations
-from schematics.schematic import Schematic, SchematicParser
-from schematics.schematic_reconstructor import SchematicReconstructor, visualize_schematic
-# from schematics.schematic_reconstructor import SchematicReconstructor, visualize_schematic
-
+from schematics.schematic import SchematicParser, Schematic
+from model_inference.text_ocr import process_schematic_with_yolo
+from schematics.schematic_reconstructor import SchematicReconstructor
 WIRE_MODEL_PATH = "models/unet_best.pth"
 YOLO_MODEL_PATH = "models/yolo.pt"
-OCR_MODEL_DIR = "./models/trocrSchematicFinal"
-def draw_component_boxes(image_bgr: np.ndarray, schematic: Schematic) -> np.ndarray:
-    output = image_bgr.copy()
-
-    for comp in schematic.components:
-        cv2.rectangle(output, (comp.xmin, comp.ymin), (comp.xmax, comp.ymax), (0, 180, 255), 2)
-    return output
+OCR_MODEL_DIR = "./models/trocr-schematic-final"
+OUTPUT_DIR = "./output"
 
 
+def run_inference(
+    image_path: str | Path,
+    reconstructor: SchematicReconstructor | None = None,
+    align: int | None = None,
+) -> tuple[Schematic, int]:
+    """Run YOLO + wire detection + filtering + alignment on ``image_path``.
 
+    Returns the finalised ``Schematic`` plus the raw polyline count (useful
+    for logging). The image's detected component XML is also written to
+    ``output/<stem>.xml`` as a side-effect
+    """
 
-def draw_polylines(
-    image_bgr: np.ndarray,
-    polylines: list[list[tuple[int, int]]],
-    random_colors: bool = True,
-    color: tuple[int, int, int] = (0, 0, 255),
-    thickness: int = 2,
-) -> np.ndarray:
-    output = image_bgr.copy()
-    rng = np.random.default_rng(42)
+    reconstructor = reconstructor or SchematicReconstructor()
+    image_path = Path(image_path)
 
-    for polyline in polylines:
-        if len(polyline) < 2:
-            continue
-       
-        points = np.array(polyline, dtype=np.int32).reshape(-1, 1, 2)
-        line_color = (
-            tuple(int(v) for v in rng.integers(40, 256, size=3))
-            if random_colors
-            else color
-        )
-        cv2.polylines(
-            output,
-            [points],
-            isClosed=False,
-            color=line_color,
-            thickness=thickness,
-            lineType=cv2.LINE_AA,
-        )
-
-    return output
-
-
-def export_processing_steps(
-    output_dir: Path,
-    image_path: Path,
-    schematic: Schematic,
-    cleaned: np.ndarray,
-    erased: np.ndarray,
-    skeleton: np.ndarray,
-    polylines: list[list[tuple[int, int]]],
-) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    image_bgr = cv2.imread(str(image_path))
-    if image_bgr is None:
-        raise FileNotFoundError(f"Could not read: {image_path}")
-
-    blank_canvas = np.full_like(image_bgr, 255)
-
-    yolo_overlay = draw_component_boxes(image_bgr, schematic)
-    polyline_overlay = draw_polylines(image_bgr, polylines, random_colors=True)
-
-    final_canvas = draw_component_boxes(blank_canvas, schematic)
-    final_canvas = draw_polylines(
-        final_canvas,
-        polylines,
-        random_colors=False,
-        color=(0, 0, 255),
-        thickness=2,
+    yolo_result = detect_components(
+        model_path=YOLO_MODEL_PATH,
+        image_path=str(image_path),
+        save_annotated=True,
+        save_directory=OUTPUT_DIR
     )
 
-    cv2.imwrite(str(output_dir / "01_original.png"), image_bgr)
-    cv2.imwrite(str(output_dir / "02_yolo_components.png"), yolo_overlay)
-    cv2.imwrite(str(output_dir / "03_erased_components.png"), erased)
-    cv2.imwrite(str(output_dir / "04_cleaned_wire_mask.png"), cleaned)
-    cv2.imwrite(str(output_dir / "05_skeleton.png"), skeleton)
-    cv2.imwrite(str(output_dir / "06_polylines_overlay.png"), polyline_overlay)
-    cv2.imwrite(str(output_dir / "07_final_canvas.png"), final_canvas)
+    schematic = SchematicParser.from_yolo_to_schematic(yolo_result)
+    schematic = process_schematic_with_yolo(
+        schematic, model_dir=Path(OCR_MODEL_DIR)
+    )
+
+    _cleaned, polylines = detect_wires(
+        image_path, schematic, WIRE_MODEL_PATH, output_dir=OUTPUT_DIR
+    )
+
+    schematic = reconstructor.filter_by_confidence(schematic)
+    schematic = reconstructor.link_text_to_components(schematic)
+    schematic = reconstructor.connect_components(schematic, polylines)
+    # Text components are retained so annotate_labels can render the OCR'd
+    # handwriting at its original bbox. draw_components/draw_lines both skip
+    # text, and connect_components already excludes it when matching wire
+    # endpoints to components.
+    #
+    # Wire-based alignment runs first to collapse tilt-induced staircases
+    # (transitively-connected components share an axis). Proximity-based
+    # alignment then mops up small residual gaps for components that the
+    # wire graph didn't link.
+    schematic = reconstructor.align_components_by_wires(schematic)
+    schematic = reconstructor.align_components(schematic, tolerance=align)
+
+    SchematicParser.save_to_xml(schematic, f"{OUTPUT_DIR}/{image_path.stem}.xml")
+
+    return schematic, len(polylines)
+
+
+def render_schematic(
+    schematic: Schematic,
+    labels: bool = True,
+    reconstructor: "SchematicReconstructor | None" = None,
+) -> np.ndarray:
+    """Render ``schematic`` to a fresh BGR canvas and return it.
+    """
+    reconstructor = reconstructor or SchematicReconstructor()
+    canvas = reconstructor.render_canvas(schematic)
+    reconstructor.draw_components(canvas, schematic)
+    reconstructor.draw_lines(canvas, schematic)
+    if labels:
+        reconstructor.annotate_labels(canvas, schematic)
+    return canvas
 
 
 
@@ -107,31 +92,10 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     img_path = args.image
-
-    # Runs the yolo model and gives the component bounding boxes
-    yolo_result = detect_components(YOLO_MODEL_PATH,img_path, save_annotated=True, save_directory= "./processing_steps")
-    schematic = SchematicParser.from_yolo_to_schematic(yolo_result)
-    schematic = process_schematic_with_yolo(schematic, OCR_MODEL_DIR)
-
-
-    cleaned, erased, skeleton, polyLines = detect_wires(
-         img_path,schematic, WIRE_MODEL_PATH
-     )
-    export_processing_steps(
-        output_dir=Path("./processing_steps"),
-        image_path=img_path,
-        schematic=schematic,
-        cleaned=cleaned,
-        erased=erased,
-        skeleton=skeleton,
-        polylines=polyLines,
-    )
-
-    schematic_recon = SchematicReconstructor()
-    schematic = schematic_recon.connect_components(schematic=schematic, polyLines=polyLines)
-    visualize_schematic(schematic, "processing_steps/schematic_graph.png")
-
-    SchematicParser.save_to_xml(schematic,"./processing_steps/out.xml")
+    
+    schematic , _line_count = run_inference(image_path=img_path)
+    canvas = render_schematic(schematic)
+    cv2.imwrite(f"{OUTPUT_DIR}/{img_path.stem}.png", canvas)
 
     
 if __name__ == "__main__":
