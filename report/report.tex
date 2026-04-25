@@ -93,7 +93,8 @@ across repeat photos of the same drawing in different conditions) rather than by
 image per epoch, with light photometric and small affine augmentations.
 Inference  runs on full images at once.
 
-\textbf{OCR:}
+\textbf{OCR:} For model training, ground-truth text bounding boxes are extracted directly from the XML annotations and expanded with a 5-pixel padding to ensure complete character inclusion. These isolated text crops are randomly split 80/20 for training and validation. During full pipeline inference, text regions are  detected and cropped from the schematic by the YOLOv8 model. All crops are then processed via the standard TrOCR feature extractor, which normalizes pixel values and resizes inputs to a standardized 384×384 resolution. 
+
 
 \section{Model Architecture and Training}
 
@@ -110,7 +111,7 @@ convolutional architecture allows training on small patches while
 evaluating on full images. The best checkpoint (epoch 9) was selected
 by validation loss.
 
-\textbf{TrOCR [3]} 
+\textbf{TrOCR [3]} trocr-small-handwritten was fine-tuned from Microsoft’s pre-trained weights using standard Cross-Entropy loss. We selected this Vision-Encoder-Decoder model to leverage its strong baseline in human handwriting recognition. This transfer learning approach allowed the model to rapidly adapt to schematic-specific alphanumeric labels within just 2 epochs at batch size 4.  
 
 \begin{table}[H]
 \caption{Training configuration for all three models.}
